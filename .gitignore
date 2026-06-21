@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+MUJOCO_LOG.TXT
+*.swp
+.DS_Store
+.vscode/
+.idea/
+.git_disabled_*/
+.python_packages/
+.robosuite_vendor/
+acados_generated/
+experiments/
+catkin_ws/experiments/
