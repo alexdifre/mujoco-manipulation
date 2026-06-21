@@ -207,6 +207,19 @@ def set_reference_to_target(problem, ee_pos, target, args):
     problem.set_reference(refs)
 
 
+def move_target_towards(current, target, max_distance):
+    current = np.asarray(current, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    max_distance = float(max_distance)
+    if max_distance <= 0.0:
+        return target.copy()
+    delta = target - current
+    distance = float(np.linalg.norm(delta))
+    if distance <= max_distance:
+        return target.copy()
+    return current + delta * (max_distance / distance)
+
+
 def run(args):
     env = environment("ur10e")
     env.reset()
@@ -238,6 +251,7 @@ def run(args):
     stage = "approach"
     stage_hold = 0
     target = approach_target.copy()
+    reference_target = robot.ee_pos.copy()
     grasp_latched = False
     latch_offset = np.zeros(3, dtype=np.float64)
     metrics = []
@@ -304,7 +318,12 @@ def run(args):
             problem.q_terminal = q_lift
 
         if step % mpc_every == 0:
-            set_reference_to_target(problem, robot.ee_pos, target, args)
+            reference_target = move_target_towards(
+                reference_target,
+                target,
+                args.target_speed * args.mpc_dt,
+            )
+            set_reference_to_target(problem, robot.ee_pos, reference_target, args)
             problem.set_previous_tau(current_tau)
             mpc_tau, _, diag = solver.step(arm.get_state())
             last_diag = diag
@@ -459,6 +478,7 @@ def parse_args():
     parser.add_argument("--mpc-dt", type=float, default=0.04)
     parser.add_argument("--num-waypoints", type=int, default=30)
     parser.add_argument("--ref-speed", type=float, default=0.08)
+    parser.add_argument("--target-speed", type=float, default=0.0)
     parser.add_argument("--direct-reference", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--track-cube-target", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--approach-clearance", type=float, default=0.02)
