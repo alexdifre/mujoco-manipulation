@@ -220,6 +220,16 @@ def move_target_towards(current, target, max_distance):
     return current + delta * (max_distance / distance)
 
 
+def stage_target_speed(stage, args):
+    if stage == "approach":
+        return args.approach_target_speed
+    if stage == "descend":
+        return args.descend_target_speed
+    if stage == "lift":
+        return args.lift_target_speed
+    return args.target_speed
+
+
 def run(args):
     env = environment("ur10e")
     env.reset()
@@ -277,10 +287,18 @@ def run(args):
             grasp_latched = True
             latch_offset = cube - finger_mid
 
-        if stage == "approach" and np.linalg.norm(robot.ee_pos - approach_target) <= args.reach_tol:
+        approach_ready = (
+            np.linalg.norm(robot.ee_pos - approach_target) <= args.reach_tol
+            and np.linalg.norm(reference_target - approach_target) <= args.reach_tol
+        )
+        grasp_ready = (
+            np.linalg.norm(robot.ee_pos - grasp_target) <= args.grasp_tol
+            and np.linalg.norm(reference_target - grasp_target) <= args.grasp_tol
+        )
+        if stage == "approach" and approach_ready:
             stage = "descend"
             stage_hold = 0
-        elif stage == "descend" and np.linalg.norm(robot.ee_pos - grasp_target) <= args.grasp_tol:
+        elif stage == "descend" and grasp_ready:
             stage = "close"
             stage_hold = 0
         elif stage == "close" and (
@@ -318,10 +336,11 @@ def run(args):
             problem.q_terminal = q_lift
 
         if step % mpc_every == 0:
+            active_target_speed = stage_target_speed(stage, args)
             reference_target = move_target_towards(
                 reference_target,
                 target,
-                args.target_speed * args.mpc_dt,
+                active_target_speed * args.mpc_dt,
             )
             set_reference_to_target(problem, robot.ee_pos, reference_target, args)
             problem.set_previous_tau(current_tau)
@@ -329,6 +348,10 @@ def run(args):
             last_diag = diag
             max_ineq = max(max_ineq, diag.inequality_violation_after)
             desired_tau = arm._clip_tau(mpc_tau if not diag.fallback_used else current_tau)
+            if args.motion_scale < 1.0:
+                bias_tau = arm._clip_tau(arm.bias_for_state(arm.get_state()))
+                desired_tau = bias_tau + float(args.motion_scale) * (desired_tau - bias_tau)
+                desired_tau = arm._clip_tau(desired_tau)
             desired_tau = apply_optional_tau_limit(desired_tau, args.apply_tau_limit)
             target_tau = limit_torque_slew(
                 desired_tau,
@@ -479,6 +502,9 @@ def parse_args():
     parser.add_argument("--num-waypoints", type=int, default=30)
     parser.add_argument("--ref-speed", type=float, default=0.08)
     parser.add_argument("--target-speed", type=float, default=0.0)
+    parser.add_argument("--approach-target-speed", type=float, default=0.0)
+    parser.add_argument("--descend-target-speed", type=float, default=0.0)
+    parser.add_argument("--lift-target-speed", type=float, default=0.0)
     parser.add_argument("--direct-reference", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--track-cube-target", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--approach-clearance", type=float, default=0.02)
@@ -505,6 +531,7 @@ def parse_args():
     parser.add_argument("--qf-weight", type=float, default=1.5)
     parser.add_argument("--qvf-weight", type=float, default=0.08)
     parser.add_argument("--delta-tau-cost", type=float, default=0.05)
+    parser.add_argument("--motion-scale", type=float, default=1.0)
     parser.add_argument("--delta-q-max", type=float, default=0.08)
     parser.add_argument("--delta-dq-max", type=float, default=0.35)
     parser.add_argument("--delta-tau-max", type=float, default=22.0)

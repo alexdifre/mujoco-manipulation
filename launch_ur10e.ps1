@@ -27,9 +27,12 @@ Push-Location $workdir
 try {
     $graspArgs = @(
         "run_ur10e_acados_grasp.py",
-        "--max-steps", "3200",
+        "--max-steps", "8000",
         "--horizon", "15",
         "--mpc-dt", "0.04",
+        "--approach-target-speed", "0.16",
+        "--descend-target-speed", "0.0",
+        "--lift-target-speed", "0.16",
         "--approach-clearance", "0.02",
         "--grasp-z-offset", "0.0",
         "--lift-z-offset", "0.18",
