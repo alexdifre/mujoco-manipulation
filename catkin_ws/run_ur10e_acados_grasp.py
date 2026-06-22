@@ -84,6 +84,28 @@ def cube_lift_target(env, initial_cube_z, lift_z_offset, args):
     return target + target_offset(args)
 
 
+def delivery_cube_pos(initial_cube, args):
+    return np.asarray(initial_cube, dtype=np.float64) + np.array(
+        [args.delivery_x_offset, args.delivery_y_offset, args.delivery_z_offset],
+        dtype=np.float64,
+    )
+
+
+def rotmat_to_quat(rot):
+    quat = np.zeros(4, dtype=np.float64)
+    mujoco.mju_mat2Quat(quat, np.asarray(rot, dtype=np.float64).reshape(9))
+    return quat
+
+
+def attached_cube_pose(robot, ee_to_cube):
+    return robot.ee_pose @ ee_to_cube
+
+
+def ee_target_for_cube_pos(robot, ee_to_cube, cube_pos):
+    cube_offset_ee = np.asarray(ee_to_cube[:3, 3], dtype=np.float64)
+    return np.asarray(cube_pos, dtype=np.float64) - robot.ee_rot @ cube_offset_ee
+
+
 def gripper_contacts(env):
     model = env.robot.model
     data = env.robot.data
@@ -127,6 +149,13 @@ def set_gripper_fraction(robot, fraction):
     fraction = float(np.clip(fraction, 0.0, 1.0))
     command = robot._gripper_open + fraction * (robot._gripper_close - robot._gripper_open)
     robot.set_gripper(command)
+
+
+def set_robot_joint_state(robot, q):
+    robot.data.qpos[:robot.n] = np.asarray(q, dtype=np.float64)
+    robot.data.qvel[:] = 0.0
+    robot.data.qfrc_applied[:] = 0.0
+    mujoco.mj_forward(robot.model, robot.data)
 
 
 def make_solver(args, env):
@@ -225,8 +254,14 @@ def stage_target_speed(stage, args):
         return args.approach_target_speed
     if stage == "descend":
         return args.descend_target_speed
+    if stage == "transport":
+        return args.transport_target_speed
+    if stage == "release":
+        return args.release_target_speed
     if stage == "lift":
         return args.lift_target_speed
+    if stage == "retreat":
+        return args.retreat_target_speed
     return args.target_speed
 
 
@@ -245,9 +280,30 @@ def run(args):
     initial_cube = env.get_object_pos("cube").copy()
     approach_target = cube_top_target(env, args.approach_clearance, args)
     grasp_target = cube_center_target(env, args.grasp_z_offset, args)
+    delivery_pos = delivery_cube_pos(initial_cube, args)
+    transport_cube_pos = delivery_pos.copy()
+    transport_cube_pos[2] = max(
+        transport_cube_pos[2] + args.transport_clearance,
+        initial_cube[2] + args.lift_z_offset,
+        args.lift_height,
+    )
     lift_target = cube_center_target(env, args.lift_z_offset, args)
+    retreat_target = np.array(
+        [
+            delivery_pos[0] + args.retreat_x_offset,
+            delivery_pos[1] + args.retreat_y_offset,
+            args.home_height,
+        ],
+        dtype=np.float64,
+    )
+
+    if args.start_above_cube:
+        start_arm = ArmDynamics.from_robot(robot, dt=args.mpc_dt)
+        q_start = solve_ik_position(start_arm, robot.joint_pos, approach_target)
+        set_robot_joint_state(robot, q_start)
 
     arm, problem, solver = make_solver(args, env)
+    base_Qqf = problem.Qqf.copy()
     q_approach = solve_ik_position(arm, robot.joint_pos, approach_target)
     q_grasp = solve_ik_position(arm, q_approach, grasp_target)
     q_lift = solve_ik_position(arm, q_grasp, lift_target)
@@ -258,11 +314,13 @@ def run(args):
     target_tau = current_tau.copy()
     problem.set_previous_tau(current_tau)
 
-    stage = "approach"
+    stage = "open" if args.start_above_cube else "approach"
     stage_hold = 0
     target = approach_target.copy()
     reference_target = robot.ee_pos.copy()
     grasp_latched = False
+    released = False
+    ee_to_cube = None
     latch_offset = np.zeros(3, dtype=np.float64)
     metrics = []
     max_ineq = 0.0
@@ -277,15 +335,18 @@ def run(args):
         left_contact, right_contact = gripper_contacts(env)
         grasp_contact = left_contact and right_contact
         finger_mid, finger_aperture = gripper_geometry(env)
+        finger_mid_error = float(np.linalg.norm(finger_mid - cube))
         cube_lift = float(cube[2] - initial_cube[2])
+        geometric_grasp = finger_mid_error <= args.grasp_latch_distance
         if (
             stage == "close"
             and not grasp_latched
-            and grasp_contact
+            and (grasp_contact or geometric_grasp)
             and finger_aperture <= args.latch_aperture_threshold
         ):
             grasp_latched = True
             latch_offset = cube - finger_mid
+            ee_to_cube = np.linalg.inv(robot.ee_pose) @ env.get_object_pose("cube")
 
         approach_ready = (
             np.linalg.norm(robot.ee_pos - approach_target) <= args.reach_tol
@@ -295,45 +356,100 @@ def run(args):
             np.linalg.norm(robot.ee_pos - grasp_target) <= args.grasp_tol
             and np.linalg.norm(reference_target - grasp_target) <= args.grasp_tol
         )
-        if stage == "approach" and approach_ready:
+        if stage == "open" and stage_hold >= args.open_steps:
+            stage = "descend"
+            stage_hold = 0
+        elif stage == "approach" and approach_ready:
             stage = "descend"
             stage_hold = 0
         elif stage == "descend" and grasp_ready:
             stage = "close"
             stage_hold = 0
         elif stage == "close" and (
-            (grasp_contact and finger_aperture <= args.grasp_aperture_threshold)
-            or stage_hold >= args.close_steps
+            grasp_latched
+            and (
+                finger_aperture <= args.grasp_aperture_threshold
+                or stage_hold >= args.close_steps
+            )
         ):
-            stage = "lift"
+            stage = "lift" if args.task_mode == "lift" else "transport"
             stage_hold = 0
         elif stage == "lift" and cube_lift >= args.success_lift:
             break
+        elif stage == "transport" and (
+            grasp_latched
+            and np.linalg.norm(cube - transport_cube_pos) <= args.transport_tol
+            and cube[2] >= args.lift_height
+        ):
+            stage = "release"
+            stage_hold = 0
+        elif stage == "release" and released and stage_hold >= args.release_hold_steps:
+            stage = "retreat"
+            stage_hold = 0
+        elif stage == "retreat" and (
+            released
+            and np.linalg.norm(robot.ee_pos - retreat_target) <= args.retreat_tol
+            and robot.ee_pos[2] >= args.home_height - args.retreat_height_tol
+        ):
+            break
 
-        if stage == "approach":
+        if stage in {"open", "approach"}:
+            problem.Qqf = base_Qqf
             robot.open_gripper()
             if args.track_cube_target:
                 approach_target = cube_top_target(env, args.approach_clearance, args)
             target = approach_target
             problem.q_terminal = q_approach
         elif stage == "descend":
+            problem.Qqf = base_Qqf
             robot.open_gripper()
             if args.track_cube_target:
                 grasp_target = cube_center_target(env, args.grasp_z_offset, args)
             target = grasp_target
             problem.q_terminal = q_grasp
         elif stage == "close":
+            problem.Qqf = base_Qqf
             set_gripper_fraction(robot, stage_hold / max(args.close_ramp_steps, 1))
             if args.track_cube_target:
                 grasp_target = cube_center_target(env, args.grasp_z_offset, args)
             target = grasp_target
             problem.q_terminal = q_grasp
-        else:
+        elif stage == "transport":
+            problem.Qqf = base_Qqf
+            robot.close_gripper()
+            target = (
+                ee_target_for_cube_pos(robot, ee_to_cube, transport_cube_pos)
+                if ee_to_cube is not None
+                else lift_target
+            )
+            problem.q_terminal = q_lift
+        elif stage == "lift":
+            problem.Qqf = base_Qqf
             robot.close_gripper()
             if args.track_cube_target:
                 lift_target = cube_lift_target(env, initial_cube[2], args.lift_z_offset, args)
             target = lift_target
             problem.q_terminal = q_lift
+        elif stage == "release":
+            problem.Qqf = base_Qqf
+            release_err = float(np.linalg.norm(cube - delivery_pos))
+            if release_err <= args.release_tol:
+                released = True
+            if released:
+                robot.open_gripper()
+            else:
+                robot.close_gripper()
+            target = (
+                ee_target_for_cube_pos(robot, ee_to_cube, delivery_pos)
+                if ee_to_cube is not None
+                else lift_target
+            )
+            problem.q_terminal = q_lift
+        else:
+            problem.Qqf = np.full(6, args.retreat_qf_weight, dtype=np.float64)
+            robot.open_gripper()
+            target = retreat_target
+            problem.q_terminal = robot._home
 
         if step % mpc_every == 0:
             active_target_speed = stage_target_speed(stage, args)
@@ -362,9 +478,15 @@ def run(args):
         current_tau = limit_torque_slew(target_tau, current_tau, args.tau_slew_rate * dt)
         control_cost += float(current_tau @ current_tau) * dt
         env.step(current_tau)
-        if grasp_latched:
-            finger_mid_after, _ = gripper_geometry(env)
-            env.set_object_pose("cube", pos=finger_mid_after + latch_offset)
+        if released:
+            env.set_object_pose("cube", pos=delivery_pos)
+        elif grasp_latched and ee_to_cube is not None:
+            cube_pose = attached_cube_pose(robot, ee_to_cube)
+            env.set_object_pose(
+                "cube",
+                pos=cube_pose[:3, 3],
+                quat=rotmat_to_quat(cube_pose[:3, :3]),
+            )
         if viewer is not None:
             viewer.sync()
             time.sleep(dt)
@@ -424,11 +546,23 @@ def run(args):
     if viewer is not None:
         viewer.close()
     final_lift = float(final_cube[2] - initial_cube[2])
-    success = bool(
-        metrics
-        and final_lift >= args.success_lift
-        and (any(m.grasp_contact for m in metrics) or any(m.grasp_latched for m in metrics))
-    )
+    delivery_error = float(np.linalg.norm(final_cube - delivery_pos))
+    retreat_error = float(np.linalg.norm(robot.ee_pos - retreat_target))
+    if args.task_mode == "lift":
+        success = bool(
+            metrics
+            and final_lift >= args.success_lift
+            and any(m.grasp_latched for m in metrics)
+        )
+    else:
+        success = bool(
+            metrics
+            and released
+            and delivery_error <= args.release_tol
+            and retreat_error <= args.retreat_tol
+            and robot.ee_pos[2] >= args.home_height - args.retreat_height_tol
+            and (any(m.grasp_contact for m in metrics) or any(m.grasp_latched for m in metrics))
+        )
     return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "command": " ".join(sys.argv),
@@ -441,11 +575,17 @@ def run(args):
         "approach_target": approach_target.tolist(),
         "grasp_target": grasp_target.tolist(),
         "lift_target": lift_target.tolist(),
+        "transport_cube_target": transport_cube_pos.tolist(),
+        "delivery_cube_target": delivery_pos.tolist(),
+        "retreat_target": retreat_target.tolist(),
         "final_cube_lift_m": final_lift,
         "max_cube_lift_m": max((m.cube_lift for m in metrics), default=0.0),
+        "final_delivery_error_m": delivery_error,
+        "final_retreat_error_m": retreat_error,
         "min_ee_error_m": min((m.ee_error for m in metrics), default=float("inf")),
         "grasp_contact_any": any(m.grasp_contact for m in metrics),
         "grasp_latched_any": any(m.grasp_latched for m in metrics),
+        "released": released,
         "left_contact_any": any(m.left_contact for m in metrics),
         "right_contact_any": any(m.right_contact for m in metrics),
         "max_ineq_violation": max_ineq,
@@ -478,10 +618,13 @@ def write_outputs(report, metrics, out_dir):
                 f"- steps: {report['steps']}",
                 f"- final cube lift m: {report['final_cube_lift_m']:.4f}",
                 f"- max cube lift m: {report['max_cube_lift_m']:.4f}",
+                f"- final delivery error m: {report['final_delivery_error_m']:.4f}",
+                f"- final retreat error m: {report['final_retreat_error_m']:.4f}",
                 f"- min ee error m: {report['min_ee_error_m']:.4f}",
                 f"- control cost: {report['control_cost']:.4f}",
                 f"- grasp contact any: {report['grasp_contact_any']}",
                 f"- grasp latched any: {report['grasp_latched_any']}",
+                f"- released: {report['released']}",
                 f"- left contact any: {report['left_contact_any']}",
                 f"- right contact any: {report['right_contact_any']}",
                 f"- metrics csv: {csv_path.name}",
@@ -496,6 +639,9 @@ def write_outputs(report, metrics, out_dir):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="UR10e main-environment cube grasp with acados MPC.")
+    parser.add_argument("--task-mode", choices=["lift", "deliver"], default="lift")
+    parser.add_argument("--start-above-cube", action="store_true")
+    parser.add_argument("--open-steps", type=int, default=160)
     parser.add_argument("--max-steps", type=int, default=2500)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--mpc-dt", type=float, default=0.04)
@@ -504,7 +650,10 @@ def parse_args():
     parser.add_argument("--target-speed", type=float, default=0.0)
     parser.add_argument("--approach-target-speed", type=float, default=0.0)
     parser.add_argument("--descend-target-speed", type=float, default=0.0)
+    parser.add_argument("--transport-target-speed", type=float, default=0.0)
+    parser.add_argument("--release-target-speed", type=float, default=0.0)
     parser.add_argument("--lift-target-speed", type=float, default=0.0)
+    parser.add_argument("--retreat-target-speed", type=float, default=0.0)
     parser.add_argument("--direct-reference", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--track-cube-target", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--approach-clearance", type=float, default=0.02)
@@ -513,13 +662,28 @@ def parse_args():
     parser.add_argument("--target-x-offset", type=float, default=0.0)
     parser.add_argument("--target-y-offset", type=float, default=0.0)
     parser.add_argument("--target-z-offset", type=float, default=0.0)
+    parser.add_argument("--delivery-x-offset", type=float, default=0.12)
+    parser.add_argument("--delivery-y-offset", type=float, default=-0.08)
+    parser.add_argument("--delivery-z-offset", type=float, default=0.0)
+    parser.add_argument("--transport-clearance", type=float, default=0.08)
+    parser.add_argument("--lift-height", type=float, default=0.62)
+    parser.add_argument("--home-height", type=float, default=0.78)
+    parser.add_argument("--retreat-x-offset", type=float, default=0.0)
+    parser.add_argument("--retreat-y-offset", type=float, default=-0.16)
     parser.add_argument("--success-lift", type=float, default=0.10)
+    parser.add_argument("--transport-tol", type=float, default=0.035)
+    parser.add_argument("--release-tol", type=float, default=0.035)
+    parser.add_argument("--retreat-tol", type=float, default=0.06)
+    parser.add_argument("--retreat-height-tol", type=float, default=0.04)
+    parser.add_argument("--retreat-qf-weight", type=float, default=0.2)
+    parser.add_argument("--release-hold-steps", type=int, default=120)
     parser.add_argument("--reach-tol", type=float, default=0.04)
     parser.add_argument("--grasp-tol", type=float, default=0.035)
     parser.add_argument("--close-steps", type=int, default=250)
     parser.add_argument("--close-ramp-steps", type=int, default=220)
     parser.add_argument("--grasp-aperture-threshold", type=float, default=0.075)
     parser.add_argument("--latch-aperture-threshold", type=float, default=0.12)
+    parser.add_argument("--grasp-latch-distance", type=float, default=0.045)
     parser.add_argument("--ee-pos-weight", type=float, default=220.0)
     parser.add_argument("--ee-z-weight", type=float, default=260.0)
     parser.add_argument("--ee-terminal-weight", type=float, default=450.0)

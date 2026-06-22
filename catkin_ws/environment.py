@@ -42,9 +42,9 @@ from robot import Robot
 
 OBJECT_DEFAULTS = {
     "cube": {
-        "pos": [-0.15, 0.6, 0.52],
-        "size": [0.03, 0.03, 0.04],
-        "mass": 0.05,
+        "pos": [-0.15, 0.6, 0.02],
+        "size": [0.02, 0.02, 0.02],
+        "mass": 0.03,
         "rgba": [0.8, 0.2, 0.2, 1.0],
         "type": "box",
         "condim": 4,
@@ -52,15 +52,7 @@ OBJECT_DEFAULTS = {
     },
 }
 
-OBSTACLE_DEFAULTS = [
-    {
-        "name": "cube_support",
-        "pos": [-0.15, 0.6, 0.24],
-        "size": [0.014, 0.014, 0.24],
-        "rgba": [0.45, 0.45, 0.45, 1.0],
-        "type": "box",
-    },
-]
+OBSTACLE_DEFAULTS = []
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
