@@ -257,11 +257,31 @@ class environment:
         T[:3,  3] = self.robot.data.xpos[bid]
         return T
 
-    def set_object_pose(self, name, pos, quat=None):
+    def object_half_height(self, name):
+        """Half-height used for simple support constraints."""
+        spec = self._object_defs[name]
+        size = spec.get("size", [0.03, 0.03, 0.03])
+        shape = spec.get("type", "box")
+        if shape == "box":
+            return float(size[2])
+        if shape == "sphere":
+            return float(size[0])
+        if shape == "cylinder":
+            return float(size[1])
+        raise ValueError(f"unsupported object shape {shape!r}")
+
+    def object_table_clearance(self, name, table_z=0.0):
+        """Signed bottom clearance above a horizontal support plane."""
+        return float(self.get_object_pos(name)[2] - self.object_half_height(name) - table_z)
+
+    def set_object_pose(self, name, pos, quat=None, min_center_z=None):
         """Teleport object to (pos, quat) and zero its velocity."""
         obj = self._objects[name]
         qadr, vadr = obj["qadr"], obj["vadr"]
-        self.robot.data.qpos[qadr:qadr + 3] = pos
+        clipped_pos = np.asarray(pos, dtype=np.float64).copy()
+        if min_center_z is not None:
+            clipped_pos[2] = max(float(clipped_pos[2]), float(min_center_z))
+        self.robot.data.qpos[qadr:qadr + 3] = clipped_pos
         if quat is not None:
             self.robot.data.qpos[qadr + 3:qadr + 7] = quat
         self.robot.data.qvel[vadr:vadr + 6] = 0.0
