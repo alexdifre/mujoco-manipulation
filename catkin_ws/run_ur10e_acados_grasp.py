@@ -348,11 +348,6 @@ def run(args):
     robot = env.robot
     robot.open_gripper()
     viewer = None
-    if args.viewer:
-        import mujoco.viewer
-        viewer = mujoco.viewer.launch_passive(robot.model, robot.data)
-        viewer.opt.sitegroup[:] = 0
-        viewer.sync()
 
     initial_cube = env.get_object_pos("cube").copy()
     min_cube_z = cube_min_center_z(env, args)
@@ -420,10 +415,19 @@ def run(args):
     lift_target = manipulation.ee_position_for_box_position(lift_box_pos)
     q_lift = solve_ik_position(arm, q_grasp, lift_target)
     start_ee_pos = robot.ee_pos.copy()
+    _, _, start_finger_mid, _ = gripper_geometry(env)
     start_xy_error = float(np.linalg.norm(start_ee_pos[:2] - initial_cube[:2]))
     start_cube_top_clearance = float(
         start_ee_pos[2] - (initial_cube[2] + env.object_half_height("cube"))
     )
+    start_finger_mid_top_clearance = float(
+        start_finger_mid[2] - (initial_cube[2] + env.object_half_height("cube"))
+    )
+    if args.viewer:
+        import mujoco.viewer
+        viewer = mujoco.viewer.launch_passive(robot.model, robot.data)
+        viewer.opt.sitegroup[:] = 0
+        viewer.sync()
     dt = robot.model.opt.timestep
     mpc_every = max(int(round(args.mpc_dt / dt)), 1)
     current_tau = arm._clip_tau(arm.bias_for_state(arm.get_state()))
@@ -796,8 +800,10 @@ def run(args):
         "steps": len(metrics),
         "initial_cube_pos": initial_cube.tolist(),
         "initial_ee_pos": start_ee_pos.tolist(),
+        "initial_finger_mid_pos": start_finger_mid.tolist(),
         "start_xy_error_m": start_xy_error,
         "start_cube_top_clearance_m": start_cube_top_clearance,
+        "start_finger_mid_top_clearance_m": start_finger_mid_top_clearance,
         "final_cube_pos": final_cube.tolist(),
         "approach_target": approach_target.tolist(),
         "grasp_target": grasp_target.tolist(),
@@ -896,6 +902,7 @@ def write_outputs(report, metrics, out_dir):
                 f"- steps: {report['steps']}",
                 f"- start xy error m: {report['start_xy_error_m']:.6f}",
                 f"- start cube top clearance m: {report['start_cube_top_clearance_m']:.6f}",
+                f"- start finger mid top clearance m: {report['start_finger_mid_top_clearance_m']:.6f}",
                 f"- final cube lift m: {report['final_cube_lift_m']:.4f}",
                 f"- max cube lift m: {report['max_cube_lift_m']:.4f}",
                 f"- final delivery error m: {report['final_delivery_error_m']:.4f}",

@@ -36,7 +36,7 @@ try {
         "--approach-target-speed", "0.0",
         "--descend-target-speed", "0.08",
         "--lift-target-speed", "0.10",
-        "--approach-clearance", "0.01",
+        "--approach-clearance", "0.003",
         "--grasp-z-offset", "0.025",
         "--lift-z-offset", "0.22",
         "--ee-pos-weight", "600",
