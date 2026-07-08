@@ -183,10 +183,7 @@ class EndEffectorManipulationDynamics:
     def contact_quality(self, left_contact, right_contact, finger_mid_error, finger_aperture, max_aperture):
         centering = 1.0 - float(finger_mid_error) / max(self.eps_grasp, 1e-9)
         closure = 1.0 - float(finger_aperture) / max(float(max_aperture), 1e-9)
-        geometric_closure = centering > 0.0 and closure > 0.0
         if left_contact and right_contact:
-            contact_score = 1.0
-        elif geometric_closure:
             contact_score = 1.0
         elif left_contact or right_contact:
             contact_score = 0.5

@@ -58,11 +58,21 @@ class GraspMetric:
     mpc_ineq: float
     tau_norm: float
     gripper_mean: float
+    left_finger_x: float
+    left_finger_y: float
+    left_finger_z: float
+    right_finger_x: float
+    right_finger_y: float
+    right_finger_z: float
     finger_mid_x: float
     finger_mid_y: float
     finger_mid_z: float
     finger_aperture: float
     finger_mid_error: float
+    enclosure_axis_error: float
+    enclosure_perp_error: float
+    enclosure_vertical_error: float
+    cube_enclosed: bool
     grasp_latched: bool
     grasp_pose_error: float
     release_pose_error: float
@@ -170,7 +180,32 @@ def gripper_geometry(env):
     right = data.xpos[right_id].copy()
     mid = 0.5 * (left + right)
     aperture = float(np.linalg.norm(left - right))
-    return mid, aperture
+    return left, right, mid, aperture
+
+
+def cube_enclosure_quality(env, left_finger, right_finger, cube_pos, args):
+    left = np.asarray(left_finger, dtype=np.float64)
+    right = np.asarray(right_finger, dtype=np.float64)
+    cube = np.asarray(cube_pos, dtype=np.float64)
+    delta = right - left
+    aperture = float(np.linalg.norm(delta))
+    if aperture < 1e-9:
+        return False, float("inf"), float("inf")
+    axis = delta / aperture
+    mid = 0.5 * (left + right)
+    rel = cube - mid
+    axis_error = float(abs(rel @ axis))
+    perp = rel - (rel @ axis) * axis
+    perp_error = float(np.linalg.norm(perp))
+    vertical_error = float(abs(cube[2] - mid[2]))
+    cube_radius = float(np.linalg.norm(env.object_half_extents("cube")))
+    enclosed = (
+        axis_error <= args.enclosure_axis_tol
+        and perp_error <= args.enclosure_perp_tol
+        and vertical_error <= args.enclosure_vertical_tol
+        and aperture <= 2.0 * cube_radius + args.enclosure_aperture_slack
+    )
+    return bool(enclosed), axis_error, perp_error, vertical_error
 
 
 def set_gripper_fraction(robot, fraction):
@@ -384,6 +419,7 @@ def run(args):
     target = approach_target.copy()
     reference_target = robot.ee_pos.copy()
     grasp_latched = False
+    bilateral_contact_hold = 0
     released = False
     ee_to_cube = None
     metrics = []
@@ -398,14 +434,35 @@ def run(args):
         cube = env.get_object_pos("cube")
         left_contact, right_contact = gripper_contacts(env)
         grasp_contact = left_contact and right_contact
-        finger_mid, finger_aperture = gripper_geometry(env)
+        left_finger, right_finger, finger_mid, finger_aperture = gripper_geometry(env)
         finger_mid_error = float(np.linalg.norm(finger_mid - cube))
+        (
+            cube_enclosed,
+            enclosure_axis_error,
+            enclosure_perp_error,
+            enclosure_vertical_error,
+        ) = cube_enclosure_quality(
+            env,
+            left_finger,
+            right_finger,
+            cube,
+            args,
+        )
         cube_lift = float(cube[2] - initial_cube[2])
-        geometric_grasp = finger_mid_error <= args.grasp_latch_distance
+        if stage == "close" and grasp_contact:
+            bilateral_contact_hold += 1
+        else:
+            bilateral_contact_hold = 0
+        latch_contact_ready = (
+            bilateral_contact_hold >= args.bilateral_contact_steps
+            if args.require_bilateral_contact
+            else grasp_contact
+        )
+        latch_enclosure_ready = args.allow_enclosure_latch and cube_enclosed
         if (
             stage == "close"
             and not grasp_latched
-            and (grasp_contact or geometric_grasp)
+            and (latch_contact_ready or latch_enclosure_ready)
             and finger_aperture <= args.latch_aperture_threshold
         ):
             grasp_latched = True
@@ -570,12 +627,24 @@ def run(args):
 
         cube = env.get_object_pos("cube")
         left_contact, right_contact = gripper_contacts(env)
-        grasp_contact = (left_contact and right_contact) or grasp_latched
+        grasp_contact = left_contact and right_contact
         cube_lift = float(cube[2] - initial_cube[2])
         post_target = target.copy()
         err = float(np.linalg.norm(robot.ee_pos - post_target))
-        finger_mid, finger_aperture = gripper_geometry(env)
+        left_finger, right_finger, finger_mid, finger_aperture = gripper_geometry(env)
         finger_mid_error = float(np.linalg.norm(finger_mid - cube))
+        (
+            cube_enclosed,
+            enclosure_axis_error,
+            enclosure_perp_error,
+            enclosure_vertical_error,
+        ) = cube_enclosure_quality(
+            env,
+            left_finger,
+            right_finger,
+            cube,
+            args,
+        )
         table_clearance = env.object_table_clearance("cube", table_z=args.table_z)
         table_penetration = max(0.0, -table_clearance)
         manip_metric = manipulation.metrics(
@@ -628,11 +697,21 @@ def run(args):
                 mpc_ineq=0.0 if last_diag is None else float(last_diag.inequality_violation_after),
                 tau_norm=float(np.linalg.norm(current_tau)),
                 gripper_mean=float(np.mean(robot.gripper())) if len(robot._gripper_ids) else 0.0,
+                left_finger_x=float(left_finger[0]),
+                left_finger_y=float(left_finger[1]),
+                left_finger_z=float(left_finger[2]),
+                right_finger_x=float(right_finger[0]),
+                right_finger_y=float(right_finger[1]),
+                right_finger_z=float(right_finger[2]),
                 finger_mid_x=float(finger_mid[0]),
                 finger_mid_y=float(finger_mid[1]),
                 finger_mid_z=float(finger_mid[2]),
                 finger_aperture=finger_aperture,
                 finger_mid_error=finger_mid_error,
+                enclosure_axis_error=enclosure_axis_error,
+                enclosure_perp_error=enclosure_perp_error,
+                enclosure_vertical_error=enclosure_vertical_error,
+                cube_enclosed=cube_enclosed,
                 grasp_latched=grasp_latched,
                 grasp_pose_error=manip_metric.grasp_pose_error,
                 release_pose_error=manip_metric.release_pose_error,
@@ -657,6 +736,8 @@ def run(args):
     physical_bilateral_contact_any = any(
         m.left_contact and m.right_contact for m in metrics
     )
+    two_finger_enclosure_any = any(m.cube_enclosed for m in metrics)
+    valid_two_finger_grasp_any = physical_bilateral_contact_any or two_finger_enclosure_any
     max_table_penetration = max(
         (m.cube_table_penetration for m in metrics),
         default=0.0,
@@ -666,6 +747,7 @@ def run(args):
             metrics
             and final_lift >= args.success_lift
             and any(m.grasp_latched for m in metrics)
+            and valid_two_finger_grasp_any
             and max_table_penetration <= args.table_penetration_tol
         )
     else:
@@ -675,7 +757,8 @@ def run(args):
             and delivery_error <= args.release_tol
             and retreat_error <= args.retreat_tol
             and robot.ee_pos[2] >= args.home_height - args.retreat_height_tol
-            and (any(m.grasp_contact for m in metrics) or any(m.grasp_latched for m in metrics))
+            and any(m.grasp_latched for m in metrics)
+            and valid_two_finger_grasp_any
             and max_table_penetration <= args.table_penetration_tol
         )
     return {
@@ -718,6 +801,8 @@ def run(args):
         ),
         "grasp_contact_any": any(m.grasp_contact for m in metrics),
         "physical_bilateral_contact_any": physical_bilateral_contact_any,
+        "two_finger_enclosure_any": two_finger_enclosure_any,
+        "valid_two_finger_grasp_any": valid_two_finger_grasp_any,
         "grasp_latched_any": any(m.grasp_latched for m in metrics),
         "released": released,
         "left_contact_any": any(m.left_contact for m in metrics),
@@ -797,6 +882,8 @@ def write_outputs(report, metrics, out_dir):
                 f"- control cost: {report['control_cost']:.4f}",
                 f"- grasp contact any: {report['grasp_contact_any']}",
                 f"- physical bilateral contact any: {report['physical_bilateral_contact_any']}",
+                f"- two finger enclosure any: {report['two_finger_enclosure_any']}",
+                f"- valid two finger grasp any: {report['valid_two_finger_grasp_any']}",
                 f"- grasp latched any: {report['grasp_latched_any']}",
                 f"- released: {report['released']}",
                 f"- left contact any: {report['left_contact_any']}",
@@ -859,6 +946,13 @@ def parse_args():
     parser.add_argument("--grasp-aperture-threshold", type=float, default=0.075)
     parser.add_argument("--latch-aperture-threshold", type=float, default=0.12)
     parser.add_argument("--grasp-latch-distance", type=float, default=0.045)
+    parser.add_argument("--require-bilateral-contact", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--bilateral-contact-steps", type=int, default=3)
+    parser.add_argument("--allow-enclosure-latch", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--enclosure-axis-tol", type=float, default=0.018)
+    parser.add_argument("--enclosure-perp-tol", type=float, default=0.075)
+    parser.add_argument("--enclosure-vertical-tol", type=float, default=0.040)
+    parser.add_argument("--enclosure-aperture-slack", type=float, default=0.070)
     parser.add_argument("--grasp-pose-tol", type=float, default=0.12)
     parser.add_argument("--gamma-max", type=float, default=1.0)
     parser.add_argument("--force-closure-eps", type=float, default=0.05)

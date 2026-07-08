@@ -259,15 +259,22 @@ class environment:
 
     def object_half_height(self, name):
         """Half-height used for simple support constraints."""
+        return float(self.object_half_extents(name)[2])
+
+    def object_half_extents(self, name):
+        """Half extents for primitive objects in world-aligned diagnostics."""
         spec = self._object_defs[name]
         size = spec.get("size", [0.03, 0.03, 0.03])
         shape = spec.get("type", "box")
         if shape == "box":
-            return float(size[2])
+            return np.asarray(size, dtype=np.float64)
         if shape == "sphere":
-            return float(size[0])
+            radius = float(size[0])
+            return np.array([radius, radius, radius], dtype=np.float64)
         if shape == "cylinder":
-            return float(size[1])
+            radius = float(size[0])
+            half_height = float(size[1])
+            return np.array([radius, radius, half_height], dtype=np.float64)
         raise ValueError(f"unsupported object shape {shape!r}")
 
     def object_table_clearance(self, name, table_z=0.0):
