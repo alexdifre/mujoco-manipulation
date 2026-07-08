@@ -26,7 +26,13 @@ from mpc_path_utils import (
     update_path_progress,
     waypoint_arclengths,
 )
-from rti_sqp_mpc import ArmNMPCProblem
+from manipulation_dynamics import (
+    EndEffectorManipulationDynamics,
+    make_pose,
+    pose_with_position,
+    rotmat_to_quat,
+)
+from rti_sqp_mpc import ArmNMPCProblem, OSQPSolver, QPBuilder, RTISolver
 
 
 @dataclass
@@ -58,6 +64,12 @@ class GraspMetric:
     finger_aperture: float
     finger_mid_error: float
     grasp_latched: bool
+    grasp_pose_error: float
+    release_pose_error: float
+    lift_margin: float
+    grasp_quality: float
+    gamma: float
+    manipulation_ineq: float
 
 
 def target_offset(args):
@@ -78,12 +90,6 @@ def cube_center_target(env, z_offset, args):
     return target + target_offset(args)
 
 
-def cube_lift_target(env, initial_cube_z, lift_z_offset, args):
-    pos = env.get_object_pos("cube")
-    target = np.array([pos[0], pos[1], initial_cube_z + float(lift_z_offset)], dtype=np.float64)
-    return target + target_offset(args)
-
-
 def delivery_cube_pos(initial_cube, args):
     return np.asarray(initial_cube, dtype=np.float64) + np.array(
         [args.delivery_x_offset, args.delivery_y_offset, args.delivery_z_offset],
@@ -91,19 +97,23 @@ def delivery_cube_pos(initial_cube, args):
     )
 
 
-def rotmat_to_quat(rot):
-    quat = np.zeros(4, dtype=np.float64)
-    mujoco.mju_mat2Quat(quat, np.asarray(rot, dtype=np.float64).reshape(9))
-    return quat
+def cube_lift_box_pos(initial_cube, lift_z_offset):
+    pos = np.asarray(initial_cube, dtype=np.float64).copy()
+    pos[2] += float(lift_z_offset)
+    return pos
 
 
-def attached_cube_pose(robot, ee_to_cube):
-    return robot.ee_pose @ ee_to_cube
-
-
-def ee_target_for_cube_pos(robot, ee_to_cube, cube_pos):
-    cube_offset_ee = np.asarray(ee_to_cube[:3, 3], dtype=np.float64)
-    return np.asarray(cube_pos, dtype=np.float64) - robot.ee_rot @ cube_offset_ee
+def manipulation_constraint_margin(stage, metric, args):
+    margins = []
+    if stage in {"close", "lift", "transport"}:
+        margins.append(float(args.grasp_pose_tol - metric.grasp_pose_error))
+    if stage in {"lift", "transport"}:
+        margins.append(float(metric.lift_margin))
+    if stage in {"close", "lift", "transport"}:
+        margins.append(float(metric.grasp_quality))
+    if stage in {"release", "retreat"}:
+        margins.append(float(args.release_tol - metric.release_pose_error))
+    return min(margins) if margins else 0.0
 
 
 def gripper_contacts(env):
@@ -189,19 +199,33 @@ def make_solver(args, env):
     if not export_dir.is_absolute():
         export_dir = Path(__file__).resolve().parents[1] / export_dir
     export_dir.mkdir(parents=True, exist_ok=True)
-    solver = AcadosRTISolver(
+    if args.solver in {"auto", "acados"}:
+        try:
+            solver = AcadosRTISolver(
+                problem,
+                config=AcadosRTIConfig(
+                    code_export_directory=str(export_dir),
+                    qp_solver=args.acados_qp_solver,
+                    qp_solver_iter_max=args.acados_qp_solver_iter_max,
+                    nlp_solver_type=args.acados_nlp_solver_type,
+                    regularization=args.regularization,
+                    verbose=args.acados_verbose,
+                ),
+                debug=args.debug,
+            )
+            return arm, problem, solver, "acados SQP_RTI"
+        except Exception:
+            if args.solver == "acados":
+                raise
+            print("acados unavailable; falling back to local RTI/OSQP solver")
+
+    solver = RTISolver(
         problem,
-        config=AcadosRTIConfig(
-            code_export_directory=str(export_dir),
-            qp_solver=args.acados_qp_solver,
-            qp_solver_iter_max=args.acados_qp_solver_iter_max,
-            nlp_solver_type=args.acados_nlp_solver_type,
-            regularization=args.regularization,
-            verbose=args.acados_verbose,
-        ),
+        qp_builder=QPBuilder(regularization=args.regularization),
+        qp_solver=OSQPSolver(max_iter=args.osqp_max_iter),
         debug=args.debug,
     )
-    return arm, problem, solver
+    return arm, problem, solver, "local RTI/OSQP"
 
 
 def solve_ik_position(arm, q0, target, iterations=160, damping=1e-3, step=0.45):
@@ -287,6 +311,7 @@ def run(args):
         initial_cube[2] + args.lift_z_offset,
         args.lift_height,
     )
+    lift_box_pos = cube_lift_box_pos(initial_cube, args.lift_z_offset)
     lift_target = cube_center_target(env, args.lift_z_offset, args)
     retreat_target = np.array(
         [
@@ -302,10 +327,28 @@ def run(args):
         q_start = solve_ik_position(start_arm, robot.joint_pos, approach_target)
         set_robot_joint_state(robot, q_start)
 
-    arm, problem, solver = make_solver(args, env)
+    arm, problem, solver, solver_name = make_solver(args, env)
     base_Qqf = problem.Qqf.copy()
     q_approach = solve_ik_position(arm, robot.joint_pos, approach_target)
     q_grasp = solve_ik_position(arm, q_approach, grasp_target)
+    _, grasp_rot = arm.forward_kinematics(q_grasp)
+    initial_cube_pose = env.get_object_pose("cube")
+    delivery_pose = pose_with_position(initial_cube_pose, delivery_pos)
+    manipulation = EndEffectorManipulationDynamics(
+        initial_box_pose=initial_cube_pose,
+        desired_box_pose=delivery_pose,
+        desired_grasp_pose=make_pose(grasp_target, grasp_rot),
+        lift_height=(
+            args.lift_height
+            if args.task_mode == "deliver"
+            else initial_cube[2] + args.success_lift
+        ),
+        eps_grasp=args.grasp_pose_tol,
+        eps_release=args.release_tol,
+        gamma_max=args.gamma_max,
+        friction_quality_eps=args.force_closure_eps,
+    )
+    lift_target = manipulation.ee_position_for_box_position(lift_box_pos)
     q_lift = solve_ik_position(arm, q_grasp, lift_target)
     dt = robot.model.opt.timestep
     mpc_every = max(int(round(args.mpc_dt / dt)), 1)
@@ -321,7 +364,6 @@ def run(args):
     grasp_latched = False
     released = False
     ee_to_cube = None
-    latch_offset = np.zeros(3, dtype=np.float64)
     metrics = []
     max_ineq = 0.0
     control_cost = 0.0
@@ -345,8 +387,8 @@ def run(args):
             and finger_aperture <= args.latch_aperture_threshold
         ):
             grasp_latched = True
-            latch_offset = cube - finger_mid
-            ee_to_cube = np.linalg.inv(robot.ee_pose) @ env.get_object_pose("cube")
+            ee_to_cube = manipulation.attach(robot.ee_pose, env.get_object_pose("cube"))
+            lift_target = manipulation.ee_position_for_box_position(lift_box_pos)
 
         approach_ready = (
             np.linalg.norm(robot.ee_pos - approach_target) <= args.reach_tol
@@ -418,7 +460,7 @@ def run(args):
             problem.Qqf = base_Qqf
             robot.close_gripper()
             target = (
-                ee_target_for_cube_pos(robot, ee_to_cube, transport_cube_pos)
+                manipulation.ee_position_for_box_position(transport_cube_pos)
                 if ee_to_cube is not None
                 else lift_target
             )
@@ -427,7 +469,8 @@ def run(args):
             problem.Qqf = base_Qqf
             robot.close_gripper()
             if args.track_cube_target:
-                lift_target = cube_lift_target(env, initial_cube[2], args.lift_z_offset, args)
+                lift_box_pos = cube_lift_box_pos(initial_cube, args.lift_z_offset)
+                lift_target = manipulation.ee_position_for_box_position(lift_box_pos)
             target = lift_target
             problem.q_terminal = q_lift
         elif stage == "release":
@@ -440,7 +483,7 @@ def run(args):
             else:
                 robot.close_gripper()
             target = (
-                ee_target_for_cube_pos(robot, ee_to_cube, delivery_pos)
+                manipulation.ee_position_for_box_position(delivery_pos)
                 if ee_to_cube is not None
                 else lift_target
             )
@@ -479,9 +522,13 @@ def run(args):
         control_cost += float(current_tau @ current_tau) * dt
         env.step(current_tau)
         if released:
-            env.set_object_pose("cube", pos=delivery_pos)
+            env.set_object_pose(
+                "cube",
+                pos=delivery_pos,
+                quat=rotmat_to_quat(delivery_pose[:3, :3]),
+            )
         elif grasp_latched and ee_to_cube is not None:
-            cube_pose = attached_cube_pose(robot, ee_to_cube)
+            cube_pose = manipulation.attached_box_pose(robot.ee_pose)
             env.set_object_pose(
                 "cube",
                 pos=cube_pose[:3, 3],
@@ -500,6 +547,20 @@ def run(args):
         err = float(np.linalg.norm(robot.ee_pos - post_target))
         finger_mid, finger_aperture = gripper_geometry(env)
         finger_mid_error = float(np.linalg.norm(finger_mid - cube))
+        manip_metric = manipulation.metrics(
+            ee_pose=robot.ee_pose,
+            box_pose=env.get_object_pose("cube"),
+            stage=stage,
+            stage_hold=stage_hold,
+            close_ramp_steps=args.close_ramp_steps,
+            released=released,
+            left_contact=left_contact,
+            right_contact=right_contact,
+            finger_mid_error=finger_mid_error,
+            finger_aperture=finger_aperture,
+            max_aperture=max(args.latch_aperture_threshold, args.grasp_aperture_threshold),
+        )
+        manipulation_ineq = manipulation_constraint_margin(stage, manip_metric, args)
         path_progress, _, _, _ = update_path_progress(
             robot.ee_pos,
             dummy_path,
@@ -539,6 +600,12 @@ def run(args):
                 finger_aperture=finger_aperture,
                 finger_mid_error=finger_mid_error,
                 grasp_latched=grasp_latched,
+                grasp_pose_error=manip_metric.grasp_pose_error,
+                release_pose_error=manip_metric.release_pose_error,
+                lift_margin=manip_metric.lift_margin,
+                grasp_quality=manip_metric.grasp_quality,
+                gamma=manip_metric.gamma,
+                manipulation_ineq=manipulation_ineq,
             )
         )
 
@@ -548,6 +615,12 @@ def run(args):
     final_lift = float(final_cube[2] - initial_cube[2])
     delivery_error = float(np.linalg.norm(final_cube - delivery_pos))
     retreat_error = float(np.linalg.norm(robot.ee_pos - retreat_target))
+    active_lift_margins = [
+        m.lift_margin for m in metrics if m.stage in {"lift", "transport"}
+    ]
+    physical_bilateral_contact_any = any(
+        m.left_contact and m.right_contact for m in metrics
+    )
     if args.task_mode == "lift":
         success = bool(
             metrics
@@ -568,7 +641,7 @@ def run(args):
         "command": " ".join(sys.argv),
         "environment": "main MuJoCo environment",
         "robot": "ur10e",
-        "solver": "acados SQP_RTI",
+        "solver": solver_name,
         "steps": len(metrics),
         "initial_cube_pos": initial_cube.tolist(),
         "final_cube_pos": final_cube.tolist(),
@@ -578,12 +651,26 @@ def run(args):
         "transport_cube_target": transport_cube_pos.tolist(),
         "delivery_cube_target": delivery_pos.tolist(),
         "retreat_target": retreat_target.tolist(),
+        "desired_grasp_pose": manipulation.desired_grasp_pose.tolist(),
+        "box_to_ee_grasp": manipulation.box_to_ee_grasp.tolist(),
+        "manipulation_lift_height_m": manipulation.lift_height,
         "final_cube_lift_m": final_lift,
         "max_cube_lift_m": max((m.cube_lift for m in metrics), default=0.0),
         "final_delivery_error_m": delivery_error,
         "final_retreat_error_m": retreat_error,
         "min_ee_error_m": min((m.ee_error for m in metrics), default=float("inf")),
+        "min_grasp_pose_error": min((m.grasp_pose_error for m in metrics), default=float("inf")),
+        "final_release_pose_error": metrics[-1].release_pose_error if metrics else float("inf"),
+        "min_active_lift_margin": min(active_lift_margins, default=0.0),
+        "max_active_lift_margin": max(active_lift_margins, default=0.0),
+        "max_grasp_quality": max((m.grasp_quality for m in metrics), default=-float("inf")),
+        "grasp_quality_success_any": any(m.grasp_quality >= 0.0 for m in metrics),
+        "min_manipulation_constraint_margin": min(
+            (m.manipulation_ineq for m in metrics),
+            default=0.0,
+        ),
         "grasp_contact_any": any(m.grasp_contact for m in metrics),
+        "physical_bilateral_contact_any": physical_bilateral_contact_any,
         "grasp_latched_any": any(m.grasp_latched for m in metrics),
         "released": released,
         "left_contact_any": any(m.left_contact for m in metrics),
@@ -600,11 +687,41 @@ def write_outputs(report, metrics, out_dir):
     csv_path = out_dir / f"ur10e_acados_grasp_metrics_{stamp}.csv"
     json_path = out_dir / f"ur10e_acados_grasp_report_{stamp}.json"
     md_path = out_dir / f"ur10e_acados_grasp_report_{stamp}.md"
+    plot_path = out_dir / f"ur10e_acados_grasp_plot_{stamp}.png"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(GraspMetric.__dataclass_fields__.keys()))
         writer.writeheader()
         for metric in metrics:
             writer.writerow(metric.__dict__)
+    if metrics:
+        import matplotlib.pyplot as plt
+
+        steps = [m.step for m in metrics]
+        fig, axes = plt.subplots(4, 1, figsize=(9, 10), sharex=True)
+        axes[0].plot(steps, [m.ee_error for m in metrics], label="ee error")
+        axes[0].set_ylabel("m")
+        axes[0].grid(True, alpha=0.3)
+        axes[1].plot(steps, [m.cube_lift for m in metrics], label="cube lift", color="tab:green")
+        axes[1].axhline(report["manipulation_lift_height_m"] - report["initial_cube_pos"][2],
+                        color="tab:gray", linestyle="--", linewidth=1)
+        axes[1].set_ylabel("m")
+        axes[1].grid(True, alpha=0.3)
+        axes[2].plot(steps, [m.grasp_quality for m in metrics], label="grasp quality", color="tab:purple")
+        axes[2].axhline(0.0, color="tab:gray", linestyle="--", linewidth=1)
+        axes[2].set_ylabel("quality")
+        axes[2].grid(True, alpha=0.3)
+        axes[3].plot(steps, [m.tau_norm for m in metrics], label="tau norm", color="tab:red")
+        axes[3].set_ylabel("Nm")
+        axes[3].set_xlabel("simulation step")
+        axes[3].grid(True, alpha=0.3)
+        for ax in axes:
+            ax.legend(loc="best")
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=140)
+        plt.close(fig)
+        report["plot_png"] = plot_path.name
+    else:
+        report["plot_png"] = None
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     md_path.write_text(
         "\n".join(
@@ -621,13 +738,22 @@ def write_outputs(report, metrics, out_dir):
                 f"- final delivery error m: {report['final_delivery_error_m']:.4f}",
                 f"- final retreat error m: {report['final_retreat_error_m']:.4f}",
                 f"- min ee error m: {report['min_ee_error_m']:.4f}",
+                f"- min grasp pose error: {report['min_grasp_pose_error']:.4f}",
+                f"- final release pose error: {report['final_release_pose_error']:.4f}",
+                f"- min active lift margin: {report['min_active_lift_margin']:.4f}",
+                f"- max active lift margin: {report['max_active_lift_margin']:.4f}",
+                f"- max grasp quality: {report['max_grasp_quality']:.4f}",
+                f"- grasp quality success any: {report['grasp_quality_success_any']}",
+                f"- min manipulation constraint margin: {report['min_manipulation_constraint_margin']:.4f}",
                 f"- control cost: {report['control_cost']:.4f}",
                 f"- grasp contact any: {report['grasp_contact_any']}",
+                f"- physical bilateral contact any: {report['physical_bilateral_contact_any']}",
                 f"- grasp latched any: {report['grasp_latched_any']}",
                 f"- released: {report['released']}",
                 f"- left contact any: {report['left_contact_any']}",
                 f"- right contact any: {report['right_contact_any']}",
                 f"- metrics csv: {csv_path.name}",
+                f"- plot png: {report['plot_png']}",
                 f"- raw json: {json_path.name}",
             ]
         )
@@ -684,6 +810,9 @@ def parse_args():
     parser.add_argument("--grasp-aperture-threshold", type=float, default=0.075)
     parser.add_argument("--latch-aperture-threshold", type=float, default=0.12)
     parser.add_argument("--grasp-latch-distance", type=float, default=0.045)
+    parser.add_argument("--grasp-pose-tol", type=float, default=0.12)
+    parser.add_argument("--gamma-max", type=float, default=1.0)
+    parser.add_argument("--force-closure-eps", type=float, default=0.05)
     parser.add_argument("--ee-pos-weight", type=float, default=220.0)
     parser.add_argument("--ee-z-weight", type=float, default=260.0)
     parser.add_argument("--ee-terminal-weight", type=float, default=450.0)
@@ -703,6 +832,8 @@ def parse_args():
     parser.add_argument("--apply-tau-limit", type=float, default=0.0)
     parser.add_argument("--max-path-lead", type=float, default=0.08)
     parser.add_argument("--waypoint-tracking-tol", type=float, default=0.08)
+    parser.add_argument("--solver", choices=["auto", "acados", "osqp"], default="auto")
+    parser.add_argument("--osqp-max-iter", type=int, default=2000)
     parser.add_argument("--acados-export-dir", default=str(Path("acados_generated") / "ur10e_rti_grasp"))
     parser.add_argument("--acados-qp-solver", default="PARTIAL_CONDENSING_HPIPM")
     parser.add_argument("--acados-qp-solver-iter-max", type=int, default=200)

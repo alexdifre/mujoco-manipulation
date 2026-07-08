@@ -50,6 +50,9 @@ def configure_acados_environment():
         path_entries = os.environ.get("PATH", "").split(os.pathsep)
         if MINGW_BIN_DIR not in path_entries:
             os.environ["PATH"] = MINGW_BIN_DIR + os.pathsep + os.environ.get("PATH", "")
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is not None:
+            add_dll_directory(MINGW_BIN_DIR)
 
 
 @dataclass

@@ -265,6 +265,7 @@ class environment:
         if quat is not None:
             self.robot.data.qpos[qadr + 3:qadr + 7] = quat
         self.robot.data.qvel[vadr:vadr + 6] = 0.0
+        mujoco.mj_forward(self.robot.model, self.robot.data)
 
     # ── Convenience ────────────────────────────────────────────────────────────
 
