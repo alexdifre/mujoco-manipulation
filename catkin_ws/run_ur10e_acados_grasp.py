@@ -419,6 +419,11 @@ def run(args):
     )
     lift_target = manipulation.ee_position_for_box_position(lift_box_pos)
     q_lift = solve_ik_position(arm, q_grasp, lift_target)
+    start_ee_pos = robot.ee_pos.copy()
+    start_xy_error = float(np.linalg.norm(start_ee_pos[:2] - initial_cube[:2]))
+    start_cube_top_clearance = float(
+        start_ee_pos[2] - (initial_cube[2] + env.object_half_height("cube"))
+    )
     dt = robot.model.opt.timestep
     mpc_every = max(int(round(args.mpc_dt / dt)), 1)
     current_tau = arm._clip_tau(arm.bias_for_state(arm.get_state()))
@@ -790,6 +795,9 @@ def run(args):
         "solver": solver_name,
         "steps": len(metrics),
         "initial_cube_pos": initial_cube.tolist(),
+        "initial_ee_pos": start_ee_pos.tolist(),
+        "start_xy_error_m": start_xy_error,
+        "start_cube_top_clearance_m": start_cube_top_clearance,
         "final_cube_pos": final_cube.tolist(),
         "approach_target": approach_target.tolist(),
         "grasp_target": grasp_target.tolist(),
@@ -886,6 +894,8 @@ def write_outputs(report, metrics, out_dir):
                 f"- robot: {report['robot']}",
                 f"- solver: {report['solver']}",
                 f"- steps: {report['steps']}",
+                f"- start xy error m: {report['start_xy_error_m']:.6f}",
+                f"- start cube top clearance m: {report['start_cube_top_clearance_m']:.6f}",
                 f"- final cube lift m: {report['final_cube_lift_m']:.4f}",
                 f"- max cube lift m: {report['max_cube_lift_m']:.4f}",
                 f"- final delivery error m: {report['final_delivery_error_m']:.4f}",
