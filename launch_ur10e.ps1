@@ -63,7 +63,7 @@ try {
         "--grasp-latch-distance", "0.080",
         "--regularization", "1e-5",
         "--target-y-offset", "0.0",
-        "--target-x-offset", "-0.005",
+        "--target-x-offset", "0.0",
         "--out-dir", "..\experiments\ur10e_acados_grasp"
     )
     if (-not $Headless) {

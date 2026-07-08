@@ -42,9 +42,9 @@ from robot import Robot
 
 OBJECT_DEFAULTS = {
     "cube": {
-        "pos": [-0.15, 0.6, 0.02],
-        "size": [0.02, 0.02, 0.02],
-        "mass": 0.03,
+        "pos": [-0.15, 0.6, 0.031],
+        "size": [0.03, 0.03, 0.03],
+        "mass": 0.10125,
         "rgba": [0.8, 0.2, 0.2, 1.0],
         "type": "box",
         "condim": 4,

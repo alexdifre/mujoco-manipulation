@@ -281,13 +281,13 @@ def make_solver(args, env):
     return arm, problem, solver, "local RTI/OSQP"
 
 
-def solve_ik_position(arm, q0, target, iterations=160, damping=1e-3, step=0.45):
+def solve_ik_position(arm, q0, target, iterations=160, damping=1e-3, step=0.45, tol=0.01):
     q = np.asarray(q0, dtype=np.float64).copy()
     target = np.asarray(target, dtype=np.float64)
     for _ in range(iterations):
         pos, _, Jp, _ = arm.forward_kinematics_jacobian(q)
         err = target - pos
-        if np.linalg.norm(err) < 0.01:
+        if np.linalg.norm(err) < float(tol):
             break
         A = Jp @ Jp.T + damping * np.eye(3)
         dq = Jp.T @ np.linalg.solve(A, err)
@@ -381,12 +381,24 @@ def run(args):
 
     if args.start_above_cube:
         start_arm = ArmDynamics.from_robot(robot, dt=args.mpc_dt)
-        q_start = solve_ik_position(start_arm, robot.joint_pos, approach_target)
+        q_start = solve_ik_position(
+            start_arm,
+            robot.joint_pos,
+            approach_target,
+            iterations=500,
+            tol=args.start_ik_tol,
+        )
         set_robot_joint_state(robot, q_start)
 
     arm, problem, solver, solver_name = make_solver(args, env)
     base_Qqf = problem.Qqf.copy()
-    q_approach = solve_ik_position(arm, robot.joint_pos, approach_target)
+    q_approach = solve_ik_position(
+        arm,
+        robot.joint_pos,
+        approach_target,
+        iterations=500,
+        tol=args.start_ik_tol,
+    )
     q_grasp = solve_ik_position(arm, q_approach, grasp_target)
     _, grasp_rot = arm.forward_kinematics(q_grasp)
     initial_cube_pose = env.get_object_pose("cube")
@@ -620,6 +632,15 @@ def run(args):
                 quat=rotmat_to_quat(cube_pose[:3, :3]),
                 min_center_z=min_cube_z,
             )
+        else:
+            free_cube_pos = env.get_object_pos("cube")
+            if free_cube_pos[2] < min_cube_z:
+                env.set_object_pose(
+                    "cube",
+                    pos=free_cube_pos,
+                    quat=env.get_object_quat("cube"),
+                    min_center_z=min_cube_z,
+                )
         if viewer is not None:
             viewer.sync()
             time.sleep(dt)
@@ -903,6 +924,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="UR10e main-environment cube grasp with acados MPC.")
     parser.add_argument("--task-mode", choices=["lift", "deliver"], default="lift")
     parser.add_argument("--start-above-cube", action="store_true")
+    parser.add_argument("--start-ik-tol", type=float, default=1e-4)
     parser.add_argument("--open-steps", type=int, default=160)
     parser.add_argument("--max-steps", type=int, default=2500)
     parser.add_argument("--horizon", type=int, default=10)
