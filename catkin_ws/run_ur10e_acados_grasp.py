@@ -320,9 +320,21 @@ def make_solver(args, env):
     return arm, problem, solver, "local RTI/OSQP"
 
 
-def solve_ik_position(arm, q0, target, iterations=160, damping=1e-3, step=0.45, tol=0.01):
+def solve_ik_position(
+    arm,
+    q0,
+    target,
+    iterations=160,
+    damping=1e-3,
+    step=0.45,
+    tol=0.01,
+    q_bias=None,
+    bias_weight=0.0,
+):
     q = np.asarray(q0, dtype=np.float64).copy()
     target = np.asarray(target, dtype=np.float64)
+    q_bias = None if q_bias is None else np.asarray(q_bias, dtype=np.float64)
+    bias_weight = float(max(bias_weight, 0.0))
     for _ in range(iterations):
         pos, _, Jp, _ = arm.forward_kinematics_jacobian(q)
         err = target - pos
@@ -330,6 +342,8 @@ def solve_ik_position(arm, q0, target, iterations=160, damping=1e-3, step=0.45, 
             break
         A = Jp @ Jp.T + damping * np.eye(3)
         dq = Jp.T @ np.linalg.solve(A, err)
+        if q_bias is not None and bias_weight > 0.0:
+            dq = dq + bias_weight * (q_bias - q)
         q = q + step * dq
         q = np.minimum(np.maximum(q, arm.q_min), arm.q_max)
     return q
@@ -413,14 +427,23 @@ def run(args):
         dtype=np.float64,
     )
 
+    start_posture_q = (
+        np.asarray(args.start_posture_q, dtype=np.float64)
+        if args.start_posture_q is not None
+        else None
+    )
+    ik_seed = start_posture_q if start_posture_q is not None else robot.joint_pos
+
     if args.start_above_cube:
         start_arm = ArmDynamics.from_robot(robot, dt=args.mpc_dt)
         q_start = solve_ik_position(
             start_arm,
-            robot.joint_pos,
+            ik_seed,
             approach_target,
             iterations=500,
             tol=args.start_ik_tol,
+            q_bias=start_posture_q,
+            bias_weight=args.start_posture_bias,
         )
         set_robot_joint_state(robot, q_start)
 
@@ -432,8 +455,16 @@ def run(args):
         approach_target,
         iterations=500,
         tol=args.start_ik_tol,
+        q_bias=start_posture_q,
+        bias_weight=args.start_posture_bias,
     )
-    q_grasp = solve_ik_position(arm, q_approach, grasp_target)
+    q_grasp = solve_ik_position(
+        arm,
+        q_approach,
+        grasp_target,
+        q_bias=start_posture_q,
+        bias_weight=args.start_posture_bias,
+    )
     _, grasp_rot = arm.forward_kinematics(q_grasp)
     initial_cube_pose = env.get_object_pose("cube")
     delivery_pose = pose_with_position(initial_cube_pose, delivery_pos)
@@ -452,8 +483,15 @@ def run(args):
         friction_quality_eps=args.force_closure_eps,
     )
     lift_target = manipulation.ee_position_for_box_position(lift_box_pos)
-    q_lift = solve_ik_position(arm, q_grasp, lift_target)
+    q_lift = solve_ik_position(
+        arm,
+        q_grasp,
+        lift_target,
+        q_bias=start_posture_q,
+        bias_weight=args.start_posture_bias,
+    )
     start_ee_pos = robot.ee_pos.copy()
+    start_joint_pos = robot.joint_pos.copy()
     _, _, start_finger_mid, _ = gripper_geometry(env)
     start_xy_error = float(np.linalg.norm(start_ee_pos[:2] - initial_cube[:2]))
     start_cube_top_clearance = float(
@@ -854,6 +892,8 @@ def run(args):
         "steps": len(metrics),
         "initial_cube_pos": initial_cube.tolist(),
         "initial_ee_pos": start_ee_pos.tolist(),
+        "initial_joint_pos": start_joint_pos.tolist(),
+        "start_posture_q": None if start_posture_q is None else start_posture_q.tolist(),
         "initial_finger_mid_pos": start_finger_mid.tolist(),
         "start_xy_error_m": start_xy_error,
         "start_cube_top_clearance_m": start_cube_top_clearance,
@@ -959,6 +999,7 @@ def write_outputs(report, metrics, out_dir):
                 f"- start xy error m: {report['start_xy_error_m']:.6f}",
                 f"- start cube top clearance m: {report['start_cube_top_clearance_m']:.6f}",
                 f"- start finger mid top clearance m: {report['start_finger_mid_top_clearance_m']:.6f}",
+                f"- initial joint pos: {np.array2string(np.asarray(report['initial_joint_pos']), precision=4)}",
                 f"- final cube lift m: {report['final_cube_lift_m']:.4f}",
                 f"- max cube lift m: {report['max_cube_lift_m']:.4f}",
                 f"- final delivery error m: {report['final_delivery_error_m']:.4f}",
@@ -999,6 +1040,8 @@ def parse_args():
     parser.add_argument("--task-mode", choices=["lift", "deliver"], default="lift")
     parser.add_argument("--start-above-cube", action="store_true")
     parser.add_argument("--start-ik-tol", type=float, default=1e-4)
+    parser.add_argument("--start-posture-q", type=float, nargs=6, default=None)
+    parser.add_argument("--start-posture-bias", type=float, default=0.0)
     parser.add_argument("--open-steps", type=int, default=160)
     parser.add_argument("--max-steps", type=int, default=2500)
     parser.add_argument("--horizon", type=int, default=10)
