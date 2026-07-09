@@ -28,6 +28,7 @@ try {
     $graspArgs = @(
         "run_ur10e_acados_grasp.py",
         "--task-mode", "lift",
+        "--solver", "osqp",
         "--start-above-cube",
         "--start-posture-q", "1.55246", "-1.33301", "2.04935", "-1.99281", "-1.62029", "0.0",
         "--start-posture-bias", "0.02",
