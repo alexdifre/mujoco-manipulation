@@ -47,8 +47,12 @@ OBJECT_DEFAULTS = {
         "mass": 0.10125,
         "rgba": [0.8, 0.2, 0.2, 1.0],
         "type": "box",
-        "condim": 4,
-        "friction": [1.2, 0.02, 0.001],
+        "condim": 6,
+        "friction": [10.0, 1.0, 0.1],
+        "margin": 0.006,
+        "priority": 1,
+        "solref": [0.001, 1.0],
+        "solimp": [0.95, 0.99, 0.001],
     },
 }
 
@@ -110,7 +114,17 @@ def _add_free_object(worldbody, name, spec):
         "size": _fmt(size),
         "rgba": _fmt(rgba),
     }
-    for key in ("contype", "conaffinity", "condim", "margin", "gap", "friction"):
+    for key in (
+        "contype",
+        "conaffinity",
+        "condim",
+        "margin",
+        "gap",
+        "friction",
+        "priority",
+        "solref",
+        "solimp",
+    ):
         if key in spec:
             value = spec[key]
             geom_attrs[key] = _fmt(value) if isinstance(value, (list, tuple)) else str(value)
