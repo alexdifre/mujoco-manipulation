@@ -32,27 +32,29 @@ ACADOS_TEMPLATE_DIR = os.path.join(
     "acados_template",
 )
 ACADOS_BIN_DIR = os.path.join(ACADOS_SOURCE_DIR, "bin")
+ACADOS_LIB_DIR = os.path.join(ACADOS_SOURCE_DIR, "lib")
 MINGW_BIN_DIR = r"C:\conda-forge\envs\mlc-stack\Library\mingw-w64\bin"
+_DLL_DIRECTORY_HANDLES = []
+
+
+def _add_dll_search_dir(path):
+    if not os.path.isdir(path):
+        return
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    if path not in path_entries:
+        os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
+    add_dll_directory = getattr(os, "add_dll_directory", None)
+    if add_dll_directory is not None:
+        _DLL_DIRECTORY_HANDLES.append(add_dll_directory(path))
 
 
 def configure_acados_environment():
     if os.path.isdir(ACADOS_TEMPLATE_DIR) and ACADOS_TEMPLATE_DIR not in sys.path:
         sys.path.insert(0, ACADOS_TEMPLATE_DIR)
     os.environ["ACADOS_SOURCE_DIR"] = ACADOS_SOURCE_DIR
-    if os.path.isdir(ACADOS_BIN_DIR):
-        path_entries = os.environ.get("PATH", "").split(os.pathsep)
-        if ACADOS_BIN_DIR not in path_entries:
-            os.environ["PATH"] = ACADOS_BIN_DIR + os.pathsep + os.environ.get("PATH", "")
-        add_dll_directory = getattr(os, "add_dll_directory", None)
-        if add_dll_directory is not None:
-            add_dll_directory(ACADOS_BIN_DIR)
-    if os.path.isdir(MINGW_BIN_DIR):
-        path_entries = os.environ.get("PATH", "").split(os.pathsep)
-        if MINGW_BIN_DIR not in path_entries:
-            os.environ["PATH"] = MINGW_BIN_DIR + os.pathsep + os.environ.get("PATH", "")
-        add_dll_directory = getattr(os, "add_dll_directory", None)
-        if add_dll_directory is not None:
-            add_dll_directory(MINGW_BIN_DIR)
+    _add_dll_search_dir(ACADOS_BIN_DIR)
+    _add_dll_search_dir(ACADOS_LIB_DIR)
+    _add_dll_search_dir(MINGW_BIN_DIR)
 
 
 @dataclass

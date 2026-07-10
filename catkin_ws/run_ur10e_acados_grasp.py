@@ -82,6 +82,7 @@ class GraspMetric:
     manipulation_ineq: float
     cube_table_clearance: float
     cube_table_penetration: float
+    gripper_cube_penetration: float
 
 
 def target_offset(args):
@@ -171,6 +172,35 @@ def gripper_contacts(env):
     return left, right
 
 
+def gripper_cube_penetration(env):
+    model = env.robot.model
+    data = env.robot.data
+    cube_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "cube_geom")
+    gripper_bodies = {
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        for name in (
+            "left_outer_knuckle",
+            "left_inner_knuckle",
+            "left_inner_finger",
+            "right_outer_knuckle",
+            "right_inner_knuckle",
+            "right_inner_finger",
+        )
+    }
+    penetration = 0.0
+    for i in range(data.ncon):
+        c = data.contact[i]
+        if c.geom1 == cube_gid:
+            other = int(model.geom_bodyid[c.geom2])
+        elif c.geom2 == cube_gid:
+            other = int(model.geom_bodyid[c.geom1])
+        else:
+            continue
+        if other in gripper_bodies:
+            penetration = max(penetration, max(0.0, -float(c.dist)))
+    return penetration
+
+
 def gripper_geometry(env):
     model = env.robot.model
     data = env.robot.data
@@ -212,6 +242,15 @@ def set_gripper_fraction(robot, fraction):
     fraction = float(np.clip(fraction, 0.0, 1.0))
     command = robot._gripper_open + fraction * (robot._gripper_close - robot._gripper_open)
     robot.set_gripper(command)
+
+
+def gripper_command_with_extra_squeeze(robot, command, extra_fraction):
+    command = np.asarray(command, dtype=np.float64)
+    extra = float(max(extra_fraction, 0.0))
+    squeezed = command + extra * (robot._gripper_close - robot._gripper_open)
+    low = np.minimum(robot._gripper_open, robot._gripper_close)
+    high = np.maximum(robot._gripper_open, robot._gripper_close)
+    return np.minimum(np.maximum(squeezed, low), high)
 
 
 def set_robot_joint_state(robot, q):
@@ -281,9 +320,21 @@ def make_solver(args, env):
     return arm, problem, solver, "local RTI/OSQP"
 
 
-def solve_ik_position(arm, q0, target, iterations=160, damping=1e-3, step=0.45, tol=0.01):
+def solve_ik_position(
+    arm,
+    q0,
+    target,
+    iterations=160,
+    damping=1e-3,
+    step=0.45,
+    tol=0.01,
+    q_bias=None,
+    bias_weight=0.0,
+):
     q = np.asarray(q0, dtype=np.float64).copy()
     target = np.asarray(target, dtype=np.float64)
+    q_bias = None if q_bias is None else np.asarray(q_bias, dtype=np.float64)
+    bias_weight = float(max(bias_weight, 0.0))
     for _ in range(iterations):
         pos, _, Jp, _ = arm.forward_kinematics_jacobian(q)
         err = target - pos
@@ -291,6 +342,8 @@ def solve_ik_position(arm, q0, target, iterations=160, damping=1e-3, step=0.45, 
             break
         A = Jp @ Jp.T + damping * np.eye(3)
         dq = Jp.T @ np.linalg.solve(A, err)
+        if q_bias is not None and bias_weight > 0.0:
+            dq = dq + bias_weight * (q_bias - q)
         q = q + step * dq
         q = np.minimum(np.maximum(q, arm.q_min), arm.q_max)
     return q
@@ -374,14 +427,23 @@ def run(args):
         dtype=np.float64,
     )
 
+    start_posture_q = (
+        np.asarray(args.start_posture_q, dtype=np.float64)
+        if args.start_posture_q is not None
+        else None
+    )
+    ik_seed = start_posture_q if start_posture_q is not None else robot.joint_pos
+
     if args.start_above_cube:
         start_arm = ArmDynamics.from_robot(robot, dt=args.mpc_dt)
         q_start = solve_ik_position(
             start_arm,
-            robot.joint_pos,
+            ik_seed,
             approach_target,
             iterations=500,
             tol=args.start_ik_tol,
+            q_bias=start_posture_q,
+            bias_weight=args.start_posture_bias,
         )
         set_robot_joint_state(robot, q_start)
 
@@ -393,8 +455,16 @@ def run(args):
         approach_target,
         iterations=500,
         tol=args.start_ik_tol,
+        q_bias=start_posture_q,
+        bias_weight=args.start_posture_bias,
     )
-    q_grasp = solve_ik_position(arm, q_approach, grasp_target)
+    q_grasp = solve_ik_position(
+        arm,
+        q_approach,
+        grasp_target,
+        q_bias=start_posture_q,
+        bias_weight=args.start_posture_bias,
+    )
     _, grasp_rot = arm.forward_kinematics(q_grasp)
     initial_cube_pose = env.get_object_pose("cube")
     delivery_pose = pose_with_position(initial_cube_pose, delivery_pos)
@@ -413,8 +483,15 @@ def run(args):
         friction_quality_eps=args.force_closure_eps,
     )
     lift_target = manipulation.ee_position_for_box_position(lift_box_pos)
-    q_lift = solve_ik_position(arm, q_grasp, lift_target)
+    q_lift = solve_ik_position(
+        arm,
+        q_grasp,
+        lift_target,
+        q_bias=start_posture_q,
+        bias_weight=args.start_posture_bias,
+    )
     start_ee_pos = robot.ee_pos.copy()
+    start_joint_pos = robot.joint_pos.copy()
     _, _, start_finger_mid, _ = gripper_geometry(env)
     start_xy_error = float(np.linalg.norm(start_ee_pos[:2] - initial_cube[:2]))
     start_cube_top_clearance = float(
@@ -440,6 +517,7 @@ def run(args):
     target = approach_target.copy()
     reference_target = robot.ee_pos.copy()
     grasp_latched = False
+    grasp_hold_gripper = None
     bilateral_contact_hold = 0
     released = False
     ee_to_cube = None
@@ -457,6 +535,7 @@ def run(args):
         grasp_contact = left_contact and right_contact
         left_finger, right_finger, finger_mid, finger_aperture = gripper_geometry(env)
         finger_mid_error = float(np.linalg.norm(finger_mid - cube))
+        contact_penetration = gripper_cube_penetration(env)
         (
             cube_enclosed,
             enclosure_axis_error,
@@ -479,11 +558,14 @@ def run(args):
             if args.require_bilateral_contact
             else grasp_contact
         )
-        latch_enclosure_ready = args.allow_enclosure_latch and cube_enclosed
+        latch_enclosure_ready = (
+            cube_enclosed if args.require_enclosure_for_latch else True
+        )
         if (
             stage == "close"
             and not grasp_latched
-            and (latch_contact_ready or latch_enclosure_ready)
+            and latch_contact_ready
+            and latch_enclosure_ready
             and finger_aperture <= args.latch_aperture_threshold
         ):
             grasp_latched = True
@@ -514,6 +596,11 @@ def run(args):
                 or stage_hold >= args.close_steps
             )
         ):
+            grasp_hold_gripper = gripper_command_with_extra_squeeze(
+                robot,
+                robot.gripper(),
+                args.grasp_hold_extra_fraction,
+            )
             stage = "lift" if args.task_mode == "lift" else "transport"
             stage_hold = 0
         elif stage == "lift" and cube_lift >= args.success_lift:
@@ -558,7 +645,10 @@ def run(args):
             problem.q_terminal = q_grasp
         elif stage == "transport":
             problem.Qqf = base_Qqf
-            robot.close_gripper()
+            if grasp_hold_gripper is not None:
+                robot.set_gripper(grasp_hold_gripper)
+            else:
+                robot.close_gripper()
             target = (
                 manipulation.ee_position_for_box_position(transport_cube_pos)
                 if ee_to_cube is not None
@@ -567,7 +657,10 @@ def run(args):
             problem.q_terminal = q_lift
         elif stage == "lift":
             problem.Qqf = base_Qqf
-            robot.close_gripper()
+            if grasp_hold_gripper is not None:
+                robot.set_gripper(grasp_hold_gripper)
+            else:
+                robot.close_gripper()
             if args.track_cube_target:
                 lift_box_pos = cube_lift_box_pos(initial_cube, args.lift_z_offset)
                 lift_target = manipulation.ee_position_for_box_position(lift_box_pos)
@@ -581,7 +674,10 @@ def run(args):
             if released:
                 robot.open_gripper()
             else:
-                robot.close_gripper()
+                if grasp_hold_gripper is not None:
+                    robot.set_gripper(grasp_hold_gripper)
+                else:
+                    robot.close_gripper()
             target = (
                 manipulation.ee_position_for_box_position(delivery_pos)
                 if ee_to_cube is not None
@@ -627,18 +723,6 @@ def run(args):
                 "cube",
                 pos=release_pos,
                 quat=rotmat_to_quat(delivery_pose[:3, :3]),
-                min_center_z=min_cube_z,
-            )
-        elif grasp_latched and ee_to_cube is not None:
-            cube_pose = supported_cube_pose(
-                manipulation.attached_box_pose(robot.ee_pose),
-                env,
-                args,
-            )
-            env.set_object_pose(
-                "cube",
-                pos=cube_pose[:3, 3],
-                quat=rotmat_to_quat(cube_pose[:3, :3]),
                 min_center_z=min_cube_z,
             )
         else:
@@ -751,6 +835,7 @@ def run(args):
                 manipulation_ineq=manipulation_ineq,
                 cube_table_clearance=table_clearance,
                 cube_table_penetration=table_penetration,
+                gripper_cube_penetration=contact_penetration,
             )
         )
 
@@ -767,9 +852,13 @@ def run(args):
         m.left_contact and m.right_contact for m in metrics
     )
     two_finger_enclosure_any = any(m.cube_enclosed for m in metrics)
-    valid_two_finger_grasp_any = physical_bilateral_contact_any or two_finger_enclosure_any
+    valid_two_finger_grasp_any = physical_bilateral_contact_any and two_finger_enclosure_any
     max_table_penetration = max(
         (m.cube_table_penetration for m in metrics),
+        default=0.0,
+    )
+    max_gripper_cube_penetration = max(
+        (m.gripper_cube_penetration for m in metrics),
         default=0.0,
     )
     if args.task_mode == "lift":
@@ -779,6 +868,7 @@ def run(args):
             and any(m.grasp_latched for m in metrics)
             and valid_two_finger_grasp_any
             and max_table_penetration <= args.table_penetration_tol
+            and max_gripper_cube_penetration <= args.gripper_cube_penetration_tol
         )
     else:
         success = bool(
@@ -790,6 +880,7 @@ def run(args):
             and any(m.grasp_latched for m in metrics)
             and valid_two_finger_grasp_any
             and max_table_penetration <= args.table_penetration_tol
+            and max_gripper_cube_penetration <= args.gripper_cube_penetration_tol
         )
     return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -797,9 +888,12 @@ def run(args):
         "environment": "main MuJoCo environment",
         "robot": "ur10e",
         "solver": solver_name,
+        "kinematic_attachment_used": False,
         "steps": len(metrics),
         "initial_cube_pos": initial_cube.tolist(),
         "initial_ee_pos": start_ee_pos.tolist(),
+        "initial_joint_pos": start_joint_pos.tolist(),
+        "start_posture_q": None if start_posture_q is None else start_posture_q.tolist(),
         "initial_finger_mid_pos": start_finger_mid.tolist(),
         "start_xy_error_m": start_xy_error,
         "start_cube_top_clearance_m": start_cube_top_clearance,
@@ -830,6 +924,7 @@ def run(args):
             default=0.0,
         ),
         "max_cube_table_penetration_m": max_table_penetration,
+        "max_gripper_cube_penetration_m": max_gripper_cube_penetration,
         "min_manipulation_constraint_margin": min(
             (m.manipulation_ineq for m in metrics),
             default=0.0,
@@ -899,10 +994,12 @@ def write_outputs(report, metrics, out_dir):
                 f"- environment: {report['environment']}",
                 f"- robot: {report['robot']}",
                 f"- solver: {report['solver']}",
+                f"- kinematic attachment used: {report['kinematic_attachment_used']}",
                 f"- steps: {report['steps']}",
                 f"- start xy error m: {report['start_xy_error_m']:.6f}",
                 f"- start cube top clearance m: {report['start_cube_top_clearance_m']:.6f}",
                 f"- start finger mid top clearance m: {report['start_finger_mid_top_clearance_m']:.6f}",
+                f"- initial joint pos: {np.array2string(np.asarray(report['initial_joint_pos']), precision=4)}",
                 f"- final cube lift m: {report['final_cube_lift_m']:.4f}",
                 f"- max cube lift m: {report['max_cube_lift_m']:.4f}",
                 f"- final delivery error m: {report['final_delivery_error_m']:.4f}",
@@ -916,6 +1013,7 @@ def write_outputs(report, metrics, out_dir):
                 f"- grasp quality success any: {report['grasp_quality_success_any']}",
                 f"- min cube table clearance m: {report['min_cube_table_clearance_m']:.4f}",
                 f"- max cube table penetration m: {report['max_cube_table_penetration_m']:.6f}",
+                f"- max gripper cube penetration m: {report['max_gripper_cube_penetration_m']:.6f}",
                 f"- min manipulation constraint margin: {report['min_manipulation_constraint_margin']:.4f}",
                 f"- control cost: {report['control_cost']:.4f}",
                 f"- grasp contact any: {report['grasp_contact_any']}",
@@ -942,6 +1040,8 @@ def parse_args():
     parser.add_argument("--task-mode", choices=["lift", "deliver"], default="lift")
     parser.add_argument("--start-above-cube", action="store_true")
     parser.add_argument("--start-ik-tol", type=float, default=1e-4)
+    parser.add_argument("--start-posture-q", type=float, nargs=6, default=None)
+    parser.add_argument("--start-posture-bias", type=float, default=0.0)
     parser.add_argument("--open-steps", type=int, default=160)
     parser.add_argument("--max-steps", type=int, default=2500)
     parser.add_argument("--horizon", type=int, default=10)
@@ -985,9 +1085,11 @@ def parse_args():
     parser.add_argument("--grasp-aperture-threshold", type=float, default=0.075)
     parser.add_argument("--latch-aperture-threshold", type=float, default=0.12)
     parser.add_argument("--grasp-latch-distance", type=float, default=0.045)
+    parser.add_argument("--grasp-hold-extra-fraction", type=float, default=0.0)
     parser.add_argument("--require-bilateral-contact", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bilateral-contact-steps", type=int, default=3)
     parser.add_argument("--allow-enclosure-latch", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--require-enclosure-for-latch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--enclosure-axis-tol", type=float, default=0.018)
     parser.add_argument("--enclosure-perp-tol", type=float, default=0.075)
     parser.add_argument("--enclosure-vertical-tol", type=float, default=0.040)
@@ -998,6 +1100,7 @@ def parse_args():
     parser.add_argument("--table-z", type=float, default=0.0)
     parser.add_argument("--table-clearance", type=float, default=0.001)
     parser.add_argument("--table-penetration-tol", type=float, default=1e-6)
+    parser.add_argument("--gripper-cube-penetration-tol", type=float, default=0.002)
     parser.add_argument("--ee-pos-weight", type=float, default=220.0)
     parser.add_argument("--ee-z-weight", type=float, default=260.0)
     parser.add_argument("--ee-terminal-weight", type=float, default=450.0)
