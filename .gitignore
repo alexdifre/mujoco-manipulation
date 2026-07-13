@@ -9,7 +9,6 @@ MUJOCO_LOG.TXT
 .git_disabled_*/
 .python_packages/
 .numba_cache/
-.robosuite_vendor/
 acados_generated/
 experiments/
 catkin_ws/experiments/

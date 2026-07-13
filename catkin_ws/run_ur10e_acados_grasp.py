@@ -32,7 +32,7 @@ from manipulation_dynamics import (
     pose_with_position,
     rotmat_to_quat,
 )
-from rti_sqp_mpc import ArmNMPCProblem, OSQPSolver, QPBuilder, RTISolver
+from rti_sqp_mpc import ArmNMPCProblem
 
 
 @dataclass
@@ -291,33 +291,19 @@ def make_solver(args, env):
     if not export_dir.is_absolute():
         export_dir = Path(__file__).resolve().parents[1] / export_dir
     export_dir.mkdir(parents=True, exist_ok=True)
-    if args.solver in {"auto", "acados"}:
-        try:
-            solver = AcadosRTISolver(
-                problem,
-                config=AcadosRTIConfig(
-                    code_export_directory=str(export_dir),
-                    qp_solver=args.acados_qp_solver,
-                    qp_solver_iter_max=args.acados_qp_solver_iter_max,
-                    nlp_solver_type=args.acados_nlp_solver_type,
-                    regularization=args.regularization,
-                    verbose=args.acados_verbose,
-                ),
-                debug=args.debug,
-            )
-            return arm, problem, solver, "acados SQP_RTI"
-        except Exception:
-            if args.solver == "acados":
-                raise
-            print("acados unavailable; falling back to local RTI/OSQP solver")
-
-    solver = RTISolver(
+    solver = AcadosRTISolver(
         problem,
-        qp_builder=QPBuilder(regularization=args.regularization),
-        qp_solver=OSQPSolver(max_iter=args.osqp_max_iter),
+        config=AcadosRTIConfig(
+            code_export_directory=str(export_dir),
+            qp_solver=args.acados_qp_solver,
+            qp_solver_iter_max=args.acados_qp_solver_iter_max,
+            nlp_solver_type=args.acados_nlp_solver_type,
+            regularization=args.regularization,
+            verbose=args.acados_verbose,
+        ),
         debug=args.debug,
     )
-    return arm, problem, solver, "local RTI/OSQP"
+    return arm, problem, solver, "acados SQP_RTI"
 
 
 def solve_ik_position(
@@ -1120,8 +1106,6 @@ def parse_args():
     parser.add_argument("--apply-tau-limit", type=float, default=0.0)
     parser.add_argument("--max-path-lead", type=float, default=0.08)
     parser.add_argument("--waypoint-tracking-tol", type=float, default=0.08)
-    parser.add_argument("--solver", choices=["auto", "acados", "osqp"], default="auto")
-    parser.add_argument("--osqp-max-iter", type=int, default=2000)
     parser.add_argument("--acados-export-dir", default=str(Path("acados_generated") / "ur10e_rti_grasp"))
     parser.add_argument("--acados-qp-solver", default="PARTIAL_CONDENSING_HPIPM")
     parser.add_argument("--acados-qp-solver-iter-max", type=int, default=200)

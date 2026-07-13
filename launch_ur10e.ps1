@@ -28,7 +28,6 @@ try {
     $graspArgs = @(
         "run_ur10e_acados_grasp.py",
         "--task-mode", "lift",
-        "--solver", "acados",
         "--start-above-cube",
         "--start-posture-q", "1.552270", "-1.401018", "2.157024", "-2.199646", "-1.619480", "-0.008517",
         "--start-posture-bias", "0.02",
@@ -73,7 +72,7 @@ try {
     if (-not $Headless) {
         $graspArgs += "--viewer"
     }
-    $output = & $conda run --no-capture-output -n robot_sim python -I @graspArgs 2>&1
+    $output = & $conda run --no-capture-output -n mlc-stack python -I @graspArgs 2>&1
     $exitCode = $LASTEXITCODE
     $output | Tee-Object -FilePath $logPath
     if ($exitCode -ne 0) {
