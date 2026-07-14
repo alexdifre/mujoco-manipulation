@@ -271,6 +271,24 @@ class environment:
         T[:3,  3] = self.robot.data.xpos[bid]
         return T
 
+    def get_object_twist(self, name):
+        """World linear and angular velocity of a free object.
+
+        MuJoCo stores a free-joint velocity as three translational followed by
+        three rotational components.  Returning copies keeps callers from
+        accidentally modifying the simulator state.
+        """
+        vadr = int(self._objects[name]["vadr"])
+        qvel = self.robot.data.qvel[vadr:vadr + 6].copy()
+        return qvel[:3], qvel[3:]
+
+    def get_object_dynamics(self, name):
+        """Return object mass and its diagonal body-frame inertia."""
+        bid = int(self._objects[name]["body_id"])
+        mass = float(self.robot.model.body_mass[bid])
+        inertia = self.robot.model.body_inertia[bid].copy()
+        return mass, inertia
+
     def object_half_height(self, name):
         """Half-height used for simple support constraints."""
         return float(self.object_half_extents(name)[2])

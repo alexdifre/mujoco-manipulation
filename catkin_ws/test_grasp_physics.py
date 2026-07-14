@@ -14,6 +14,9 @@ import sys
 import os
 import time
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 import mujoco
 import numpy as np
 
@@ -29,7 +32,6 @@ from run_ur10e_acados_grasp import (
     cube_min_center_z,
     cube_top_target,
     delivery_cube_pos,
-    gripper_contacts,
     gripper_geometry,
     limit_torque_slew,
     make_pose,
@@ -45,6 +47,8 @@ from run_ur10e_acados_grasp import (
 )
 from arm_dynamics import ArmDynamics
 from environment import environment
+from grasp_phase_mpc import ContactSample, PhaseGraspMPC
+from unified_grasp_mpc import UnifiedGraspMPC
 from manipulation_dynamics import EndEffectorManipulationDynamics, make_pose, pose_with_position
 
 
@@ -289,6 +293,7 @@ def get_contacts_with_cube(env):
     model = env.robot.model
     data = env.robot.data
     cube_gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "cube_geom")
+    cube_body = int(model.geom_bodyid[cube_gid])
     contacts = []
     f6 = np.zeros(6)
     for ci in range(data.ncon):
@@ -302,6 +307,12 @@ def get_contacts_with_cube(env):
             other_gid, sign = c.geom1, 1.0
         normal = sign * c.frame[:3].copy()
         other_body = int(model.geom_bodyid[other_gid])
+        jac_other = np.zeros((3, model.nv), dtype=np.float64)
+        jac_cube = np.zeros((3, model.nv), dtype=np.float64)
+        mj.mj_jac(model, data, jac_other, None, c.pos, other_body)
+        mj.mj_jac(model, data, jac_cube, None, c.pos, cube_body)
+        relative_velocity = (jac_other - jac_cube) @ data.qvel
+        tangential_velocity = relative_velocity - normal * float(relative_velocity @ normal)
         body_name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, other_body)
         geom_name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, other_gid)
         contacts.append({
@@ -310,6 +321,7 @@ def get_contacts_with_cube(env):
             "other_body": other_body,
             "other_body_name": body_name,
             "other_geom_name": geom_name,
+            "slip_speed": float(np.linalg.norm(tangential_velocity)),
         })
     return contacts
 
@@ -322,7 +334,35 @@ def classify_finger(body_id, left_bodies, right_bodies):
     return "other"
 
 
-def print_diagnostics(env, stage_label, left_bodies, right_bodies):
+def gripper_close_fraction(robot):
+    """Normalized position-servo command: 0=open, 1=closed."""
+    command = robot.gripper()
+    span = robot._gripper_close - robot._gripper_open
+    valid = np.abs(span) > 1e-12
+    if not np.any(valid):
+        return 0.0
+    fraction = (command[valid] - robot._gripper_open[valid]) / span[valid]
+    return float(np.clip(np.mean(fraction), 0.0, 1.0))
+
+
+def finger_contact_samples(env, left_bodies, right_bodies):
+    samples = []
+    for contact in get_contacts_with_cube(env):
+        side = classify_finger(contact["other_body"], left_bodies, right_bodies)
+        if side not in {"left", "right"}:
+            continue
+        samples.append(ContactSample(
+            side=side,
+            position=contact["pos"],
+            normal=contact["normal"],
+            normal_force=contact["fn"],
+            tangential_force=contact["ft"],
+            slip_speed=contact["slip_speed"],
+        ))
+    return samples
+
+
+def print_diagnostics(env, stage_label, left_bodies, right_bodies, grasp_decision=None):
     """Compact grasp-quality snapshot; returns the metrics dict."""
     MU = 1.0  # cube sliding friction — keep in sync with environment.py
     cube = env.get_object_pos("cube")
@@ -369,13 +409,18 @@ def print_diagnostics(env, stage_label, left_bodies, right_bodies):
         t1 /= np.linalg.norm(t1) + 1e-12
         t2 = np.cross(n, t1)
         t2 /= np.linalg.norm(t2) + 1e-12
-        for angle in np.linspace(0.0, np.pi, 5):
+        for angle in np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False):
             d = n + MU * (np.cos(angle) * t1 + np.sin(angle) * t2)
             d /= np.linalg.norm(d) + 1e-12
             rays.append(np.concatenate([d, np.cross(p, d)]))
     G = np.array(rays, dtype=np.float64).T if rays else np.zeros((6, 0))
     sigma_min = float(np.linalg.svd(G, compute_uv=False)[-1]) if G.shape[1] >= 6 else 0.0
     force_closure = sigma_min >= 0.05
+    wrench_feasible = bool(
+        grasp_decision is not None and grasp_decision.wrench.feasible
+    )
+    wrench_evaluated = grasp_decision is not None
+    wrench_label = "PASS" if wrench_feasible else ("FAIL" if wrench_evaluated else "N/A")
 
     all_in_cone = all(
         np.linalg.norm(c["ft"]) / abs(c["fn"]) <= MU
@@ -395,10 +440,13 @@ def print_diagnostics(env, stage_label, left_bodies, right_bodies):
           f"enclosure {'PASS' if enclosed else 'FAIL'} "
           f"(axis {axis_err:.3f}, perp {perp_err:.3f}, vert {vert_err:.3f}) | "
           f"force-closure {'PASS' if force_closure else 'FAIL'} (sigma_min {sigma_min:.3f}) | "
+          f"required-wrench {wrench_label} | "
           f"friction-cone {'PASS' if all_in_cone else 'FAIL'}")
 
     return {
         "bilateral": bilateral, "force_closure": force_closure,
+        "wrench_feasible": wrench_feasible,
+        "wrench_evaluated": wrench_evaluated,
         "enclosed": enclosed, "friction_cone": all_in_cone,
         "aperture": aperture, "axis_err": axis_err,
         "perp_err": perp_err, "vert_err": vert_err,
@@ -437,8 +485,40 @@ def run_test(args):
         mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, n)
         for n in ("right_outer_knuckle", "right_inner_knuckle", "right_inner_finger")
     }
+    cube_body_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "cube")
+    cube_mass = float(model.body_mass[cube_body_id])
+    _, cube_inertia = env.get_object_dynamics("cube")
 
     arm, problem, solver, solver_name = make_solver(args, env)
+    grasp_mpc = PhaseGraspMPC(
+        dt=args.mpc_dt,
+        horizon=args.grasp_mpc_horizon,
+        friction_coefficient=args.grasp_friction_coefficient,
+        friction_margin=args.grasp_friction_margin,
+        torsional_friction_coefficient=args.grasp_torsional_friction,
+        normal_force_max=args.grasp_normal_force_max,
+        preload_force=args.grasp_preload_force,
+        contact_close_rate=args.grasp_contact_close_rate,
+        close_rate_max=args.grasp_close_rate_max,
+        max_slip_speed=args.grasp_slip_speed_max,
+        lift_safety_factor=args.grasp_lift_safety_factor,
+        stable_steps_required=args.grasp_stable_mpc_steps,
+    )
+    unified_grasp_mpc = UnifiedGraspMPC(
+        arm=arm,
+        dt=args.mpc_dt,
+        horizon=args.unified_grasp_horizon,
+        friction_coefficient=(
+            args.grasp_friction_coefficient - args.grasp_friction_margin
+        ),
+        torsional_friction_coefficient=args.grasp_torsional_friction,
+        normal_force_max=args.grasp_normal_force_max,
+        close_rate_max=args.grasp_close_rate_max,
+        max_slip_speed=args.grasp_slip_speed_max,
+        table_z=args.table_z,
+        object_half_height=env.object_half_height("cube"),
+        max_iterations=args.unified_grasp_max_iterations,
+    )
 
     # Position-only IK for the stage targets, then sanity-check that the pad
     # midpoint at q_grasp lands on the cube center.
@@ -498,37 +578,32 @@ def run_test(args):
     bilateral_contact_hold = 0
     ee_to_cube = None
     last_diag = None
+    grasp_decision = None
+    unified_decision = None
+    hold_completed = False
+    hold_cube_target = None
     diagnostics = {}
 
     for step in range(args.max_steps):
         cube = env.get_object_pos("cube")
-        left_contact, right_contact = gripper_contacts(env)
+        contact_samples = finger_contact_samples(env, left_bodies, right_bodies)
+        left_contact = any(contact.side == "left" for contact in contact_samples)
+        right_contact = any(contact.side == "right" for contact in contact_samples)
         grasp_contact = left_contact and right_contact
         left_finger, right_finger, finger_mid, finger_aperture = gripper_geometry(env)
         cube_lift = float(cube[2] - initial_cube[2])
 
-        if stage == "close" and grasp_contact:
+        if stage == "contact" and grasp_contact:
             bilateral_contact_hold += 1
         else:
             bilateral_contact_hold = 0
 
-        latch_contact_ready = (
+        contact_ready = (
             bilateral_contact_hold >= args.bilateral_contact_steps
             if args.require_bilateral_contact else grasp_contact
         )
         cube_enclosed_flag = cube_enclosure_quality(env, left_finger, right_finger, cube, args)[0]
-        latch_enclosure_ready = cube_enclosed_flag if args.require_enclosure_for_latch else True
-
-        if (stage == "close" and not grasp_latched
-            and latch_contact_ready and latch_enclosure_ready
-            and finger_aperture <= args.latch_aperture_threshold):
-            grasp_latched = True
-            ee_to_cube = manipulation.attach(robot.ee_pose, env.get_object_pose("cube"))
-            lift_target = manipulation.ee_position_for_box_position(lift_box_pos)
-            # Record wrist_3 angle at latch for orientation holding
-            wrist3_at_latch = robot.joint_pos[5]
-            diagnostics["at_latch"] = print_diagnostics(
-                env, f"GRASP LATCHED (step {step})", left_bodies, right_bodies)
+        enclosure_ready = cube_enclosed_flag if args.require_enclosure_for_latch else True
 
         approach_ready = (
             np.linalg.norm(robot.ee_pos - approach_target) <= args.reach_tol
@@ -540,7 +615,7 @@ def run_test(args):
         )
 
         # Trajectory trace (watch for dip-below-then-rise before the grasp)
-        if step % 100 == 0 and stage in ("approach", "descend", "close"):
+        if step % 100 == 0 and stage in ("approach", "descend", "contact", "preload"):
             print(f"  [{stage:8s} {step:4d}] ee_z={robot.ee_pos[2]:+.3f} -> tgt_z={target[2]:+.3f}  "
                   f"xy_err={np.linalg.norm(robot.ee_pos[:2] - target[:2]):.3f}  "
                   f"aperture={finger_aperture:.3f}")
@@ -550,34 +625,76 @@ def run_test(args):
             stage_hold = 0
             print(f">>> approach -> descend  (step {step})")
         elif stage == "descend" and grasp_ready:
-            stage = "close"
+            stage = "contact"
             stage_hold = 0
-            print(f">>> descend -> close  (step {step})")
+            print(f">>> descend -> contact MPC  (step {step})")
             diagnostics["at_close_start"] = print_diagnostics(
                 env, f"CLOSE START (step {step})", left_bodies, right_bodies)
-        elif stage == "close" and (
-            grasp_latched and (finger_aperture <= args.grasp_aperture_threshold or stage_hold >= args.close_steps)
+        elif (stage == "contact" and contact_ready and enclosure_ready
+              and finger_aperture <= args.latch_aperture_threshold):
+            stage = "preload"
+            stage_hold = 0
+            print(f">>> contact -> preload MPC  (step {step})")
+        elif (
+            stage == "preload"
+            and grasp_decision is not None
+            and grasp_decision.lift_ready
+            and unified_decision is not None
+            and unified_decision.optimizer_success
         ):
+            grasp_latched = True
+            ee_to_cube = manipulation.attach(robot.ee_pose, env.get_object_pose("cube"))
+            lift_target = manipulation.ee_position_for_box_position(lift_box_pos)
+            diagnostics["at_latch"] = print_diagnostics(
+                env, f"GRASP MPC FEASIBLE (step {step})", left_bodies, right_bodies,
+                grasp_decision=grasp_decision)
             stage = "lift"
             stage_hold = 0
-            print(f">>> close -> lift  (step {step})")
+            print(
+                f">>> preload -> lift MPC  (step {step}, "
+                f"Fn=({grasp_decision.actual_normal_by_side['left']:.1f},"
+                f"{grasp_decision.actual_normal_by_side['right']:.1f}) N, "
+                f"slip={grasp_decision.max_slip_speed:.4f} m/s)"
+            )
             diagnostics["at_lift_start"] = print_diagnostics(
-                env, f"LIFT START (step {step})", left_bodies, right_bodies)
+                env, f"LIFT START (step {step})", left_bodies, right_bodies,
+                grasp_decision=grasp_decision)
         elif stage == "lift" and cube_lift >= args.success_lift:
             print(f">>> lift success  (step {step}, lift={cube_lift:.4f} m) — holding")
+            hold_cube_target = cube.copy()
+            lift_done_contacts = finger_contact_samples(env, left_bodies, right_bodies)
+            grasp_decision = grasp_mpc.step(
+                phase="lift",
+                close_fraction=gripper_close_fraction(robot),
+                contacts=lift_done_contacts,
+                object_center=cube,
+                object_mass=cube_mass,
+            )
             diagnostics["at_lift_done"] = print_diagnostics(
-                env, f"LIFT DONE (step {step})", left_bodies, right_bodies)
+                env, f"LIFT DONE (step {step})", left_bodies, right_bodies,
+                grasp_decision=grasp_decision)
             stage = "hold"
             stage_hold = 0
             continue
         elif stage == "hold":
-            robot.close_gripper()
             if stage_hold % 200 == 0:
                 cz = env.get_object_pos("cube")[2]
                 print(f"  [hold {stage_hold:3d}] cube_z={cz:.4f}  above_table={'YES' if cz > 0.05 else 'NO'}")
             if stage_hold >= 500:  # ~10 s of pure physical holding
                 cz = env.get_object_pos("cube")[2]
                 print(f">>> hold complete — cube_z={cz:.4f} m, held physically: {'YES' if cz > 0.05 else 'NO'}")
+                final_contacts = finger_contact_samples(env, left_bodies, right_bodies)
+                grasp_decision = grasp_mpc.step(
+                    phase="hold",
+                    close_fraction=gripper_close_fraction(robot),
+                    contacts=final_contacts,
+                    object_center=env.get_object_pos("cube"),
+                    object_mass=cube_mass,
+                )
+                diagnostics["at_hold_done"] = print_diagnostics(
+                    env, f"HOLD DONE (step {step})", left_bodies, right_bodies,
+                    grasp_decision=grasp_decision)
+                hold_completed = cz > 0.05
                 break
 
         if stage in {"approach"}:
@@ -593,44 +710,107 @@ def run_test(args):
             if target[2] < 0.04:
                 target[2] = 0.04
             problem.q_terminal = q_grasp
-        elif stage == "close":
+        elif stage in {"contact", "preload"}:
             problem.Qqf = base_Qqf
-            set_gripper_fraction(robot, stage_hold / max(args.close_ramp_steps, 1))
             target = grasp_target_adjusted
             problem.q_terminal = q_grasp
         elif stage == "lift":
             problem.Qqf = base_Qqf
-            robot.close_gripper()
-            target = lift_target
+            lift_safe = (
+                grasp_decision is not None
+                and grasp_decision.bilateral_contact
+                and grasp_decision.wrench.feasible
+                and grasp_decision.min_friction_margin >= 0.0
+                and grasp_decision.max_slip_speed <= 2.0 * args.grasp_slip_speed_max
+            )
+            target = lift_target if lift_safe else robot.ee_pos.copy()
             problem.q_terminal = q_lift
         elif stage == "hold":
             problem.Qqf = base_Qqf
-            robot.close_gripper()
             target = robot.ee_pos.copy()  # hold current position
             problem.q_terminal = robot.joint_pos.copy()
 
         if step % mpc_every == 0:
+            if stage in PhaseGraspMPC.ACTIVE_PHASES:
+                grasp_decision = grasp_mpc.step(
+                    phase=stage,
+                    close_fraction=gripper_close_fraction(robot),
+                    contacts=contact_samples,
+                    object_center=cube,
+                    object_mass=cube_mass,
+                    desired_vertical_accel=0.15 if stage == "lift" else 0.0,
+                )
+                if args.debug or (stage in {"contact", "preload"} and step % 100 == 0):
+                    print(
+                        f"    grasp MPC: phase={stage} close={grasp_decision.command_fraction:.3f} "
+                        f"rate={grasp_decision.closure_rate:+.3f}/s "
+                        f"Fn=({grasp_decision.actual_normal_by_side['left']:.1f},"
+                        f"{grasp_decision.actual_normal_by_side['right']:.1f})/"
+                        f"{grasp_decision.target_normal_force:.1f} N "
+                        f"wrench={'OK' if grasp_decision.wrench.feasible else 'NO'} "
+                        f"res=({grasp_decision.wrench.force_residual:.3f} N,"
+                        f"{grasp_decision.wrench.torque_residual:.4f} Nm) "
+                        f"margin={grasp_decision.min_friction_margin:.2f} N "
+                        f"slip={grasp_decision.max_slip_speed:.4f} m/s "
+                        f"stable={grasp_decision.stable_steps}/{args.grasp_stable_mpc_steps}"
+                    )
             active_speed = stage_target_speed(stage, args)
             reference_target = move_target_towards(reference_target, target, active_speed * args.mpc_dt)
             set_reference_to_target(problem, robot.ee_pos, reference_target, args)
             problem.set_previous_tau(current_tau)
             mpc_tau, _, diag = solver.step(arm.get_state())
             last_diag = diag
-            desired_tau = arm._clip_tau(mpc_tau if not diag.fallback_used else current_tau)
+            nominal_tau = arm._clip_tau(
+                mpc_tau if not diag.fallback_used else current_tau
+            )
+            desired_tau = nominal_tau
+
+            if stage in UnifiedGraspMPC.ACTIVE_PHASES and grasp_decision is not None:
+                object_linear_velocity, object_angular_velocity = env.get_object_twist("cube")
+                if stage == "lift" and np.linalg.norm(target - lift_target) < 1e-6:
+                    object_target = lift_box_pos
+                elif stage == "hold" and hold_cube_target is not None:
+                    object_target = hold_cube_target
+                else:
+                    object_target = initial_cube
+                unified_decision = unified_grasp_mpc.step(
+                    phase=stage,
+                    nominal_tau=nominal_tau,
+                    close_fraction=gripper_close_fraction(robot),
+                    desired_gripper_rate=grasp_decision.closure_rate,
+                    target_normal_force=grasp_decision.target_normal_force,
+                    contacts=contact_samples,
+                    finger_positions=(left_finger, right_finger),
+                    object_position=cube,
+                    object_rotation=env.get_object_pose("cube")[:3, :3],
+                    object_linear_velocity=object_linear_velocity,
+                    object_angular_velocity=object_angular_velocity,
+                    object_mass=cube_mass,
+                    object_inertia=cube_inertia,
+                    ee_target=reference_target,
+                    object_target=object_target,
+                    q_target=problem.q_terminal,
+                )
+                desired_tau = unified_decision.tau
+                set_gripper_fraction(robot, unified_decision.command_fraction)
+                if args.debug or (
+                    stage in {"preload", "lift", "hold"}
+                    and (step % 100 == 0 or unified_decision.fallback_used)
+                ):
+                    print(
+                        f"    unified OCP: phase={stage} "
+                        f"ok={'YES' if unified_decision.optimizer_success else 'NO'} "
+                        f"fallback={'YES' if unified_decision.fallback_used else 'NO'} "
+                        f"lambda_n=({unified_decision.planned_normal_by_side['left']:.2f},"
+                        f"{unified_decision.planned_normal_by_side['right']:.2f}) N "
+                        f"eq={unified_decision.equality_residual:.2e} "
+                        f"ineq={unified_decision.min_inequality_margin:.2e} "
+                        f"slip_pred={unified_decision.max_predicted_slip:.4f} m/s"
+                    )
             desired_tau = apply_optional_tau_limit(desired_tau, args.apply_tau_limit)
             target_tau = limit_torque_slew(desired_tau, current_tau, args.tau_slew_rate * args.mpc_dt)
 
         current_tau = limit_torque_slew(target_tau, current_tau, args.tau_slew_rate * dt)
-
-        # ── Wrist orientation hold during lift/close ──
-        # MPC doesn't track orientation, so add a PD spring on wrist_3
-        if stage in ("lift", "close") and grasp_latched:
-            wrist3_err = wrist3_at_latch - robot.joint_pos[5]
-            # Normalize angle to [-pi, pi]
-            wrist3_err = (wrist3_err + np.pi) % (2 * np.pi) - np.pi
-            wrist3_hold_torque = 20.0 * wrist3_err - 2.0 * robot.joint_vel[5]
-            current_tau[5] += wrist3_hold_torque
-            current_tau = arm._clip_tau(current_tau)
 
         env.step(current_tau)
 
@@ -646,13 +826,25 @@ def run_test(args):
     # ── Summary ──
     print(f"\n{'=' * 78}")
     print(f"  {'stage':16s} {'bilateral':>9s} {'enclosure':>9s} {'f-closure':>9s} "
-          f"{'f-cone':>7s} {'aperture':>8s} {'contacts':>8s}")
+          f"{'wrench':>7s} {'f-cone':>7s} {'aperture':>8s} {'contacts':>8s}")
     for label, d in diagnostics.items():
         flags = ["PASS" if d[k] else "FAIL"
-                 for k in ("bilateral", "enclosed", "force_closure", "friction_cone")]
+                 for k in ("bilateral", "enclosed", "force_closure")]
+        flags.append(
+            "PASS" if d["wrench_feasible"]
+            else ("FAIL" if d["wrench_evaluated"] else "N/A")
+        )
+        flags.append("PASS" if d["friction_cone"] else "FAIL")
         print(f"  {label:16s} {flags[0]:>9s} {flags[1]:>9s} {flags[2]:>9s} "
-              f"{flags[3]:>7s} {d['aperture']:8.3f} {d['n_finger_contacts']:8d}")
+              f"{flags[3]:>7s} {flags[4]:>7s} {d['aperture']:8.3f} "
+              f"{d['n_finger_contacts']:8d}")
     print("=" * 78)
+
+    if not hold_completed:
+        raise RuntimeError(
+            "grasp MPC test did not complete a physical lift and hold "
+            f"within {args.max_steps} simulation steps"
+        )
 
     if viewer:
         print("\nViewer open — close to exit.")
@@ -664,7 +856,7 @@ def run_test(args):
 def main():
     viewer = "--viewer" in sys.argv[1:]
     sys.argv = [sys.argv[0], "--task-mode", "lift", "--max-steps", "5000",
-                "--solver", "osqp", "--grasp-tol", "0.05",
+                "--grasp-tol", "0.05",
                 # TCP target = cube center + 6 cm: pads [+0.00,+0.07] rel TCP wrap
                 # the cube's upper half without bottoming out on the table.
                 "--grasp-z-offset", "0.06",
