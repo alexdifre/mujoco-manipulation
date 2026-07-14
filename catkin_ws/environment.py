@@ -48,11 +48,11 @@ OBJECT_DEFAULTS = {
         "rgba": [0.8, 0.2, 0.2, 1.0],
         "type": "box",
         "condim": 6,
-        "friction": [10.0, 1.0, 0.1],
-        "margin": 0.006,
+        "friction": [1.0, 0.005, 0.0001],
+        "margin": 0.001,
         "priority": 1,
-        "solref": [0.001, 1.0],
-        "solimp": [0.95, 0.99, 0.001],
+        "solref": [0.002, 1.0],
+        "solimp": [0.99, 0.999, 0.0001],
     },
 }
 
